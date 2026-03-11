@@ -11,6 +11,8 @@ compaction, rollback, fork, and provider migration.
 
 Running the binary with no arguments opens the interactive TUI.
 
+![CSM TUI Preview](assets/csm-tui-preview.en.svg)
+
 ## Repository
 
 - Repository name

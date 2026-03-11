@@ -1,0 +1,118 @@
+<svg width="1440" height="760" viewBox="0 0 1440 760" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="760" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#121417"/>
+      <stop offset="1" stop-color="#0A0C0F"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="1440" height="760" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <style>
+      .mono {
+        font-family: "Cascadia Code","JetBrains Mono","Fira Code",Consolas,Monaco,monospace;
+        font-variant-ligatures: none;
+      }
+      .title { fill: #E8EAED; font-size: 26px; font-weight: 700; }
+      .meta { fill: #B8BEC9; font-size: 15px; }
+      .dim { fill: #7F8793; font-size: 15px; }
+      .paneTitle { fill: #F5F7FA; font-size: 16px; font-weight: 700; }
+      .item { fill: #E6EAF0; font-size: 14px; }
+      .itemDim { fill: #8D95A2; font-size: 14px; }
+      .label { fill: #D7DCE3; font-size: 14px; font-weight: 600; }
+      .value { fill: #F4F7FB; font-size: 14px; }
+      .footer { fill: #A8B0BC; font-size: 14px; }
+    </style>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <rect x="12" y="12" width="1416" height="736" rx="14" fill="url(#bg)" stroke="#2B313A" stroke-width="2"/>
+  </g>
+
+  <rect x="28" y="28" width="1384" height="40" rx="8" fill="#171B20" stroke="#2C333D"/>
+  <text x="44" y="54" class="mono title">codex-session-manager TUI</text>
+  <text x="438" y="54" class="mono meta">· 417 threads · 2 providers · English (F2)</text>
+
+  <rect x="28" y="84" width="612" height="592" rx="8" fill="#0D1117" stroke="#3A404B" stroke-width="2"/>
+  <rect x="656" y="84" width="756" height="592" rx="8" fill="#0D1117" stroke="#3A404B" stroke-width="2"/>
+
+  <text x="38" y="110" class="mono paneTitle">Threads by provider</text>
+  <text x="668" y="110" class="mono paneTitle">Thread details</text>
+
+  <rect x="36" y="122" width="596" height="30" fill="#D8DEE9"/>
+  <rect x="40" y="127" width="10" height="20" rx="2" fill="#39D353"/>
+  <text x="58" y="143" class="mono item" fill="#111418">migration-plan-review.md</text>
+  <text x="418" y="143" class="mono itemDim" fill="#4F5A67">· 2026-03-11 08:43</text>
+
+  <text x="52" y="175" class="mono item">Continue session 7f3c2e10-54ab-4fd7 -</text>
+  <text x="370" y="175" class="mono itemDim">· 2026-03-10 14:06</text>
+  <text x="52" y="205" class="mono item">Respond to greeting</text>
+  <text x="285" y="205" class="mono itemDim">· 2026-03-10 05:37</text>
+  <text x="52" y="235" class="mono item">Continue</text>
+  <text x="158" y="235" class="mono itemDim">· 2026-03-09 09:10</text>
+  <text x="52" y="265" class="mono item">Continue</text>
+  <text x="158" y="265" class="mono itemDim">· 2026-03-09 08:58</text>
+  <text x="52" y="295" class="mono item">Continue</text>
+  <text x="158" y="295" class="mono itemDim">· 2026-03-09 08:58</text>
+  <text x="52" y="325" class="mono item">Continue</text>
+  <text x="158" y="325" class="mono itemDim">· 2026-03-09 08:22</text>
+  <text x="52" y="355" class="mono item">Continue</text>
+  <text x="158" y="355" class="mono itemDim">· 2026-03-09 07:37</text>
+  <text x="52" y="385" class="mono item">Continue</text>
+  <text x="158" y="385" class="mono itemDim">· 2026-03-09 03:42</text>
+  <text x="52" y="415" class="mono item">Prompt</text>
+  <text x="130" y="415" class="mono itemDim">· 2026-03-07 03:09</text>
+  <text x="52" y="445" class="mono item">Prompt</text>
+  <text x="130" y="445" class="mono itemDim">· 2026-03-07 03:09</text>
+  <text x="52" y="475" class="mono item">hello</text>
+  <text x="106" y="475" class="mono itemDim">· 2026-03-07 03:08</text>
+  <text x="52" y="517" class="mono item">draft provider switch plan</text>
+  <text x="286" y="517" class="mono itemDim">· 2026-03-06 04:41</text>
+  <text x="52" y="547" class="mono item">check context window budget</text>
+  <text x="302" y="547" class="mono itemDim">· 2026-03-06 03:19</text>
+  <text x="52" y="577" class="mono item">list available migration options</text>
+  <text x="318" y="577" class="mono itemDim">· 2026-03-06 03:16</text>
+  <text x="52" y="619" class="mono item">This sample preview shows a terminal-style TUI with provider-grouped</text>
+  <text x="52" y="649" class="mono item">threads on the left and runtime/session details on the right.</text>
+
+  <text x="672" y="142" class="mono label">Title: </text>
+  <text x="736" y="142" class="mono value">migration-plan-review.md</text>
+  <text x="672" y="170" class="mono label">Index name: </text>
+  <text x="768" y="170" class="mono value">not set</text>
+  <text x="672" y="198" class="mono label">Provider: </text>
+  <text x="760" y="198" class="mono value">openai</text>
+  <text x="672" y="226" class="mono label">State: </text>
+  <text x="736" y="226" class="mono value">active</text>
+  <text x="672" y="254" class="mono label">Thread ID: </text>
+  <text x="776" y="254" class="mono value">7f3c2e10-54ab-4fd7-9b44-1d2b3c4e5f67</text>
+  <text x="672" y="282" class="mono label">Created: </text>
+  <text x="752" y="282" class="mono value">2026-02-11T08:24:46.202Z</text>
+  <text x="672" y="310" class="mono label">Updated: </text>
+  <text x="752" y="310" class="mono value">2026-03-11T08:43:49Z</text>
+  <text x="672" y="338" class="mono label">Source: </text>
+  <text x="744" y="338" class="mono value">cli</text>
+  <text x="672" y="366" class="mono label">Path: </text>
+  <text x="720" y="366" class="mono value">C:\Users\demo\.codex\sessions\2026\03\11\rollout-2026-03-11T08-30-00-7f3c2e10-54ab-4fd7-9b44-1d2b3c4e5f67.jsonl</text>
+  <text x="672" y="394" class="mono label">Cwd: </text>
+  <text x="720" y="394" class="mono value">D:\workspace\sample-app</text>
+  <text x="672" y="422" class="mono label">Model: </text>
+  <text x="736" y="422" class="mono value">gpt-5.4</text>
+  <text x="672" y="450" class="mono label">Context window: </text>
+  <text x="816" y="450" class="mono value">950000</text>
+  <text x="672" y="478" class="mono label">Context tokens: </text>
+  <text x="816" y="478" class="mono value">496988</text>
+  <text x="672" y="506" class="mono label">Session total tokens: </text>
+  <text x="856" y="506" class="mono value">30960531</text>
+  <text x="672" y="534" class="mono label">User turns: </text>
+  <text x="776" y="534" class="mono value">366</text>
+  <text x="672" y="562" class="mono label">Memory mode: </text>
+  <text x="792" y="562" class="mono value">none</text>
+  <text x="672" y="590" class="mono label">Forked from: </text>
+  <text x="792" y="590" class="mono value">19a2b6d0-2f44-4df8-8c2e-5a1b7c9d3e40</text>
+
+  <text x="672" y="638" class="mono paneTitle">Preview</text>
+  <text x="672" y="666" class="mono value">migration-plan-review.md</text>
+
+  <rect x="28" y="692" width="1384" height="40" rx="8" fill="#171B20" stroke="#2C333D"/>
+  <text x="42" y="717" class="mono footer">Keys: ↑/↓ move · Enter actions · r refresh · F2 language · q quit</text>
+  <text x="872" y="717" class="mono dim">Loaded 417 threads across 2 providers (265 active, 151 archived)</text>
+</svg>
