@@ -41,6 +41,20 @@ The project intentionally reuses Codex-native semantics where that matters. It
 does not invent hidden thread state, and it does not fake migration by blindly
 rewriting history.
 
+## Recommended Entry Point
+
+For most day-to-day session switching and recovery work, start with
+`smart`.
+
+`smart` is the primary high-level workflow in CSM. It presents a guided
+provider/model picker, shows a pre-execution plan, and then decides whether the
+selected thread should stay on the same thread with runtime repair or move
+through the native migration path.
+
+```powershell
+cargo run -- smart <thread-id-or-rollout-path>
+```
+
 This tool is intentionally built on Codex's existing Rust internals instead of
 re-implementing thread behavior:
 
@@ -167,6 +181,7 @@ CLI.
     provider/model/profile.
 - `smart`
   - Opens an interactive provider/model picker.
+  - This is the recommended command for most users.
   - The confirm step shows the planned execution path before anything runs.
   - Provider choices come from global `config.toml` entries and referenced
     profile providers.
