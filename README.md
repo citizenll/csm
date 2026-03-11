@@ -2,7 +2,7 @@
 
 Codex Session Manager
 
-[English README](README.md) | [简体中文说明](README.zh-CN.md)
+[简体中文说明](README.zh-CN.md)
 
 CSM is a source-backed CLI and TUI for inspecting, repairing, and migrating
 Codex sessions. It works directly with rollout files and Codex configuration
