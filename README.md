@@ -1,5 +1,5 @@
 # 🌟 CSM (Codex Session Manager)
-[简体中文](https://www.google.com/search?q=README.zh-CN.md)
+[简体中文](./README.zh-CN.md)
 **The Simple, Intuitive Toolkit for Codex Sessions**
 
 Ever run into a broken chat history, found yourself unable to continue a conversation after switching AI models, or just didn't know how to clean up your old threads? **CSM is your session manager and first-aid kit.**

@@ -1,5 +1,5 @@
 # 🌟 CSM (Codex Session Manager)
-[English](README.md)
+[English](./README.md)
 
 **简单、直观的 Codex 会话管理与修复工具**
 
