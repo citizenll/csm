@@ -116,13 +116,22 @@ async fn execute_selection(
         )
     });
 
-    if selection.execution_mode == SmartExecutionMode::Distill {
+    if matches!(
+        selection.execution_mode,
+        SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic
+    ) {
         return run_command(Command::Distill(DistillArgs {
             target: args.target,
             provider: Some(selection.provider),
             model: Some(selection.model),
             context_window: selection.target_context_window,
             auto_compact_token_limit: selection.target_auto_compact_token_limit,
+            distill_mode: match selection.execution_mode {
+                SmartExecutionMode::DistillCodex => crate::cli::DistillMode::Codex,
+                SmartExecutionMode::DistillDeterministic => crate::cli::DistillMode::Deterministic,
+                SmartExecutionMode::Direct => unreachable!(),
+            },
+            reasoning_effort: None,
             thread_name: summary.thread_name.clone(),
             write_profile: Some(target_profile),
             archive_source: args.archive_source,
@@ -291,12 +300,17 @@ enum SmartStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmartExecutionMode {
     Direct,
-    Distill,
+    DistillCodex,
+    DistillDeterministic,
 }
 
 impl SmartExecutionMode {
-    fn all() -> [SmartExecutionMode; 2] {
-        [SmartExecutionMode::Direct, SmartExecutionMode::Distill]
+    fn all() -> [SmartExecutionMode; 3] {
+        [
+            SmartExecutionMode::Direct,
+            SmartExecutionMode::DistillCodex,
+            SmartExecutionMode::DistillDeterministic,
+        ]
     }
 }
 
@@ -598,7 +612,9 @@ fn plan_preview(
         && selection.target_context_window.is_some();
     let same_provider = selection.provider == current_provider;
     let strategy = match execution_mode {
-        SmartExecutionMode::Distill => SmartStrategy::DistillSuccessor,
+        SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic => {
+            SmartStrategy::DistillSuccessor
+        }
         SmartExecutionMode::Direct => {
             match (same_provider, needs_compaction, needs_repair_resume_state) {
                 (true, false, false) => SmartStrategy::SameThreadProfileOnly,
@@ -888,15 +904,22 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                             "Direct switch",
                             "Repair or migrate the selected thread directly",
                         ),
-                        (PickerLanguage::English, SmartExecutionMode::Distill) => (
-                            "Distill successor",
-                            "Create a lighter successor session and continue there",
+                        (PickerLanguage::English, SmartExecutionMode::DistillCodex) => (
+                            "Codex distill",
+                            "Use Codex to generate a lighter successor session",
+                        ),
+                        (PickerLanguage::English, SmartExecutionMode::DistillDeterministic) => (
+                            "Deterministic distill",
+                            "Build a lighter successor session from rule-based extraction",
                         ),
                         (PickerLanguage::Chinese, SmartExecutionMode::Direct) => {
                             ("直接切换", "直接在当前线程上修复或迁移")
                         }
-                        (PickerLanguage::Chinese, SmartExecutionMode::Distill) => {
-                            ("提炼继任会话", "生成一个更轻的新会话并转到那里继续工作")
+                        (PickerLanguage::Chinese, SmartExecutionMode::DistillCodex) => {
+                            ("Codex 提炼", "用 Codex 生成一个更轻的新会话")
+                        }
+                        (PickerLanguage::Chinese, SmartExecutionMode::DistillDeterministic) => {
+                            ("规则提炼", "按规则提取有效历史，生成更轻的新会话")
                         }
                     };
                     let line = if index == picker.execution_mode_index {
@@ -1000,14 +1023,16 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                         "Execution mode: {}",
                         match preview.selection.execution_mode {
                             SmartExecutionMode::Direct => "direct switch",
-                            SmartExecutionMode::Distill => "distill successor",
+                            SmartExecutionMode::DistillCodex => "codex distill",
+                            SmartExecutionMode::DistillDeterministic => "deterministic distill",
                         }
                     ),
                     (PickerLanguage::Chinese, Some(preview)) => format!(
                         "执行模式：{}",
                         match preview.selection.execution_mode {
                             SmartExecutionMode::Direct => "直接切换",
-                            SmartExecutionMode::Distill => "提炼继任会话",
+                            SmartExecutionMode::DistillCodex => "Codex 提炼",
+                            SmartExecutionMode::DistillDeterministic => "规则提炼",
                         }
                     ),
                     (PickerLanguage::English, None) => "Execution mode: ".to_string(),
@@ -1370,7 +1395,55 @@ mod tests {
             SmartSelection {
                 provider: "yunyi".to_string(),
                 model: "gpt-5.2".to_string(),
-                execution_mode: SmartExecutionMode::Distill,
+                execution_mode: SmartExecutionMode::DistillCodex,
+                target_config: config,
+                target_context_window: Some(258400),
+                target_auto_compact_token_limit: Some(232560),
+            },
+        );
+
+        assert_eq!(preview.strategy, SmartStrategy::DistillSuccessor);
+        assert_eq!(preview.blocked_reason, None);
+    }
+
+    #[tokio::test]
+    async fn plan_preview_uses_distill_strategy_for_deterministic_mode() {
+        let config = sample_config().await;
+        let preview = plan_preview(
+            &SessionSummary {
+                thread_id: "thread-1".to_string(),
+                thread_name: None,
+                rollout_path: "D:/tmp/rollout.jsonl".into(),
+                archived: false,
+                source: "cli".to_string(),
+                session_provider: Some("openai".to_string()),
+                session_cwd: "D:/tmp".into(),
+                session_timestamp: "2026-03-11T00:00:00Z".to_string(),
+                latest_model: Some("gpt-5.4".to_string()),
+                latest_total_tokens: Some(1000),
+                latest_context_tokens: Some(400000),
+                latest_model_context_window: Some(950000),
+                user_turns: 1,
+                first_user_message: None,
+                forked_from_id: None,
+                memory_mode: None,
+            },
+            "openai",
+            "gpt-5.4",
+            &SmartArgs {
+                target: TargetArgs {
+                    target: "thread-1".to_string(),
+                    config_profile: None,
+                },
+                write_profile: Some("distilled".to_string()),
+                archive_source: false,
+                max_pre_compactions: 3,
+                timeout_secs: 300,
+            },
+            SmartSelection {
+                provider: "openai".to_string(),
+                model: "gpt-5.2".to_string(),
+                execution_mode: SmartExecutionMode::DistillDeterministic,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),

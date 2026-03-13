@@ -1,4 +1,5 @@
 use crate::cli::DistillArgs;
+use crate::cli::DistillMode;
 use crate::operations::archive_rollout_file;
 use crate::operations::build_thread_manager;
 use crate::operations::reconcile_rollout_path;
@@ -17,8 +18,10 @@ use codex_core::append_thread_name;
 use codex_core::parse_turn_item;
 use codex_core::read_session_meta_line;
 use codex_core::util::normalize_thread_name;
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -50,16 +53,34 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         raw_rollout_lines.as_slice(),
         args.recent_turns,
     );
-    let brief = build_distilled_brief(&summary, &analysis);
+    let deterministic_brief = build_distilled_brief(&summary, &analysis);
     let successor_thread_name =
         default_distilled_thread_name(&summary, args.thread_name.as_deref())?;
     let target_runtime_config = load_distill_runtime_config(&args, &summary).await?;
+    let session_source = read_session_meta_line(summary.rollout_path.as_path())
+        .await?
+        .meta
+        .source;
+    let brief = match args.distill_mode {
+        DistillMode::Deterministic => deterministic_brief.clone(),
+        DistillMode::Codex => {
+            run_codex_distillation(
+                &target_runtime_config,
+                session_source,
+                deterministic_brief.as_str(),
+                parse_reasoning_effort(args.reasoning_effort.as_deref())?,
+                args.timeout_secs,
+            )
+            .await?
+        }
+    };
     let report = build_report(
         &summary,
         &analysis,
         brief.as_str(),
         successor_thread_name.clone(),
         &target_runtime_config,
+        args.distill_mode,
     );
 
     if args.preview_only {
@@ -185,6 +206,7 @@ struct DistillReport {
     successor_provider: String,
     successor_model: String,
     successor_context_window: Option<i64>,
+    distill_mode: String,
     successor_thread_name: String,
     successor_seed_tokens_estimate: usize,
     compression_ratio: Option<f64>,
@@ -450,6 +472,7 @@ fn build_report(
     brief: &str,
     successor_thread_name: String,
     target_runtime_config: &codex_core::config::Config,
+    distill_mode: DistillMode,
 ) -> DistillReport {
     let successor_seed_tokens_estimate = approx_token_count(brief);
     let compression_ratio = summary.latest_context_tokens.and_then(|source_tokens| {
@@ -468,6 +491,10 @@ fn build_report(
         successor_provider: target_runtime_config.model_provider_id.clone(),
         successor_model: target_runtime_config.model.clone().unwrap_or_default(),
         successor_context_window: target_runtime_config.model_context_window,
+        distill_mode: match distill_mode {
+            DistillMode::Codex => "codex".to_string(),
+            DistillMode::Deterministic => "deterministic".to_string(),
+        },
         successor_thread_name,
         successor_seed_tokens_estimate,
         compression_ratio,
@@ -492,6 +519,79 @@ async fn load_distill_runtime_config(
         args.auto_compact_token_limit,
     )
     .await
+}
+
+async fn run_codex_distillation(
+    runtime_config: &codex_core::config::Config,
+    session_source: codex_protocol::protocol::SessionSource,
+    deterministic_brief: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    timeout_secs: u64,
+) -> Result<String> {
+    let mut ephemeral_config = runtime_config.clone();
+    ephemeral_config.ephemeral = true;
+    let (thread_manager, _auth_manager) = build_thread_manager(&ephemeral_config, session_source);
+    let new_thread = thread_manager
+        .start_thread(ephemeral_config.clone())
+        .await
+        .context("failed to start ephemeral codex distillation thread")?;
+    let model = ephemeral_config
+        .model
+        .clone()
+        .context("could not resolve model slug for codex distillation")?;
+    let submit_id = new_thread
+        .thread
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: codex_distillation_prompt(deterministic_brief),
+                text_elements: Vec::new(),
+            }],
+            cwd: ephemeral_config.cwd.clone(),
+            approval_policy: ephemeral_config.permissions.approval_policy.value(),
+            sandbox_policy: ephemeral_config.permissions.sandbox_policy.get().clone(),
+            model,
+            effort: reasoning_effort,
+            summary: Some(ReasoningSummaryConfig::None),
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: None,
+            personality: ephemeral_config.personality,
+        })
+        .await
+        .context("failed to submit codex distillation turn")?;
+
+    let result =
+        wait_for_turn_completion_last_message(&new_thread.thread, submit_id.as_str(), timeout_secs)
+            .await;
+    let shutdown_result =
+        shutdown_thread(&thread_manager, new_thread.thread_id, &new_thread.thread).await;
+    let last_message = result?;
+    shutdown_result?;
+    last_message.context("codex distillation returned no assistant message")
+}
+
+fn codex_distillation_prompt(deterministic_brief: &str) -> String {
+    format!(
+        "You are distilling a Codex project session into a lightweight successor handoff.\n\nRewrite the following deterministic handoff into a shorter, higher-signal brief.\n\nRequirements:\n- Keep only durable project context, current goals, unresolved work, active constraints, and risks.\n- Drop greetings, repeated explanations, solved dead ends, and verbose prose.\n- Preserve concrete technical facts when they still matter.\n- Output plain markdown.\n- Keep the result compact and operational.\n\nSource brief:\n\n{deterministic_brief}"
+    )
+}
+
+fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = match value.trim().to_ascii_lowercase().as_str() {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" | "x-high" => ReasoningEffort::XHigh,
+        other => bail!(
+            "unsupported reasoning effort `{other}`; expected one of: none, minimal, low, medium, high, xhigh"
+        ),
+    };
+    Ok(Some(parsed))
 }
 
 fn print_output(output: DistillOutput, json: bool) -> Result<()> {
@@ -533,6 +633,7 @@ fn print_output(output: DistillOutput, json: bool) -> Result<()> {
             .successor_context_window
             .map_or_else(String::new, |value| value.to_string())
     );
+    println!("distill_mode: {}", output.report.distill_mode);
     println!(
         "successor_seed_tokens_estimate: {}",
         output.report.successor_seed_tokens_estimate
@@ -591,6 +692,16 @@ async fn wait_for_seed_turn_completion(
     submit_id: &str,
     timeout_secs: u64,
 ) -> Result<()> {
+    wait_for_turn_completion_last_message(thread, submit_id, timeout_secs)
+        .await
+        .map(|_| ())
+}
+
+async fn wait_for_turn_completion_last_message(
+    thread: &std::sync::Arc<codex_core::CodexThread>,
+    submit_id: &str,
+    timeout_secs: u64,
+) -> Result<Option<String>> {
     let wait = async {
         loop {
             let event = thread.next_event().await?;
@@ -598,7 +709,7 @@ async fn wait_for_seed_turn_completion(
                 continue;
             }
             match event.msg {
-                EventMsg::TurnComplete(_) => return Ok(()),
+                EventMsg::TurnComplete(completed) => return Ok(completed.last_agent_message),
                 EventMsg::Error(error) => bail!(error.message),
                 _ => {}
             }
@@ -686,10 +797,13 @@ mod tests {
     use super::approx_token_count;
     use super::build_distilled_brief;
     use super::build_report;
+    use super::parse_reasoning_effort;
+    use crate::cli::DistillMode;
     use crate::types::SessionSummary;
     use codex_core::config::ConfigBuilder;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::RolloutItem;
@@ -825,6 +939,7 @@ mod tests {
             brief.as_str(),
             "Distilled".to_string(),
             &runtime,
+            DistillMode::Deterministic,
         );
         assert_eq!(
             report.successor_seed_tokens_estimate,
@@ -833,5 +948,19 @@ mod tests {
         assert!(report.compression_ratio.is_some());
         assert_eq!(report.successor_thread_name, "Distilled");
         assert_eq!(report.successor_provider, "openai");
+        assert_eq!(report.distill_mode, "deterministic");
+    }
+
+    #[test]
+    fn parse_reasoning_effort_accepts_known_values() {
+        assert_eq!(
+            parse_reasoning_effort(Some("minimal")).expect("parse"),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            parse_reasoning_effort(Some("xhigh")).expect("parse"),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert!(parse_reasoning_effort(Some("unknown")).is_err());
     }
 }

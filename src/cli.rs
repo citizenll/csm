@@ -1,10 +1,17 @@
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 use std::path::PathBuf;
 
 pub(crate) const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 300;
 pub(crate) const DEFAULT_ROLLBACK_TIMEOUT_SECS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum DistillMode {
+    Codex,
+    Deterministic,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "codex-session-manager")]
@@ -287,6 +294,14 @@ pub(crate) struct DistillArgs {
     /// Override target auto-compact token threshold for the distilled successor session.
     #[arg(long)]
     pub(crate) auto_compact_token_limit: Option<i64>,
+
+    /// Distillation backend to use for generating the successor handoff brief.
+    #[arg(long, value_enum, default_value_t = DistillMode::Codex)]
+    pub(crate) distill_mode: DistillMode,
+
+    /// Optional reasoning effort for Codex-backed distillation.
+    #[arg(long)]
+    pub(crate) reasoning_effort: Option<String>,
 
     /// Optional thread name for the distilled successor session.
     #[arg(long)]
