@@ -272,6 +272,22 @@ pub(crate) struct DistillArgs {
     #[command(flatten)]
     pub(crate) target: TargetArgs,
 
+    /// Override target provider for the distilled successor session.
+    #[arg(long)]
+    pub(crate) provider: Option<String>,
+
+    /// Override target model for the distilled successor session.
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+
+    /// Override target model context window for the distilled successor session.
+    #[arg(long)]
+    pub(crate) context_window: Option<i64>,
+
+    /// Override target auto-compact token threshold for the distilled successor session.
+    #[arg(long)]
+    pub(crate) auto_compact_token_limit: Option<i64>,
+
     /// Optional thread name for the distilled successor session.
     #[arg(long)]
     pub(crate) thread_name: Option<String>,

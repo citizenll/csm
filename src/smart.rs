@@ -1,5 +1,6 @@
 use crate::cli::Command;
 use crate::cli::CompactArgs;
+use crate::cli::DistillArgs;
 use crate::cli::MigrateArgs;
 use crate::cli::RepairResumeStateArgs;
 use crate::cli::SmartArgs;
@@ -115,6 +116,24 @@ async fn execute_selection(
         )
     });
 
+    if selection.execution_mode == SmartExecutionMode::Distill {
+        return run_command(Command::Distill(DistillArgs {
+            target: args.target,
+            provider: Some(selection.provider),
+            model: Some(selection.model),
+            context_window: selection.target_context_window,
+            auto_compact_token_limit: selection.target_auto_compact_token_limit,
+            thread_name: summary.thread_name.clone(),
+            write_profile: Some(target_profile),
+            archive_source: args.archive_source,
+            preview_only: false,
+            json: false,
+            recent_turns: 8,
+            timeout_secs: args.timeout_secs,
+        }))
+        .await;
+    }
+
     if selection.provider == current_provider {
         let mut compactions_run = 0_u32;
         if let Some(target_window) = selection.target_context_window {
@@ -208,6 +227,7 @@ struct SmartContext<'a> {
 struct SmartSelection {
     provider: String,
     model: String,
+    execution_mode: SmartExecutionMode,
     target_config: Config,
     target_context_window: Option<i64>,
     target_auto_compact_token_limit: Option<i64>,
@@ -228,6 +248,7 @@ enum SmartStrategy {
     SameThreadRepairAfterCompaction,
     CrossProviderMigrate,
     CrossProviderMigrateAfterCompaction,
+    DistillSuccessor,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +275,7 @@ struct SmartPicker {
     provider_index: usize,
     models: Vec<ModelPreset>,
     model_index: usize,
+    execution_mode_index: usize,
     step: SmartStep,
     preview: Option<SmartPreview>,
 }
@@ -262,7 +284,20 @@ struct SmartPicker {
 enum SmartStep {
     Provider,
     Model,
+    Mode,
     Confirm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartExecutionMode {
+    Direct,
+    Distill,
+}
+
+impl SmartExecutionMode {
+    fn all() -> [SmartExecutionMode; 2] {
+        [SmartExecutionMode::Direct, SmartExecutionMode::Distill]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -306,6 +341,7 @@ impl SmartPicker {
             provider_index,
             models: Vec::new(),
             model_index: 0,
+            execution_mode_index: 0,
             step: SmartStep::Provider,
             preview: None,
         };
@@ -367,13 +403,32 @@ impl SmartPicker {
                         (picker.model_index + 1).min(picker.models.len().saturating_sub(1));
                 }
                 (SmartStep::Model, KeyCode::Enter) => {
+                    picker.execution_mode_index = 0;
+                    picker.preview = None;
+                    picker.step = SmartStep::Mode;
+                }
+                (SmartStep::Mode, KeyCode::Esc) => {
+                    picker.step = SmartStep::Model;
+                }
+                (SmartStep::Mode, KeyCode::Up) => {
+                    picker.preview = None;
+                    picker.execution_mode_index = picker.execution_mode_index.saturating_sub(1);
+                }
+                (SmartStep::Mode, KeyCode::Down) => {
+                    picker.preview = None;
+                    picker.execution_mode_index = (picker.execution_mode_index + 1)
+                        .min(SmartExecutionMode::all().len().saturating_sub(1));
+                }
+                (SmartStep::Mode, KeyCode::Enter) => {
                     let provider = picker.selected_provider().to_string();
                     let model = picker.selected_model()?.model.clone();
-                    picker.preview = Some(build_preview(&context, provider, model).await?);
+                    let execution_mode = picker.selected_execution_mode();
+                    picker.preview =
+                        Some(build_preview(&context, provider, model, execution_mode).await?);
                     picker.step = SmartStep::Confirm;
                 }
                 (SmartStep::Confirm, KeyCode::Esc) => {
-                    picker.step = SmartStep::Model;
+                    picker.step = SmartStep::Mode;
                 }
                 (SmartStep::Confirm, KeyCode::Enter) => {
                     let preview = picker.preview.clone().context("missing smart preview")?;
@@ -396,6 +451,13 @@ impl SmartPicker {
         self.models
             .get(self.model_index)
             .context("no models available for selected provider")
+    }
+
+    fn selected_execution_mode(&self) -> SmartExecutionMode {
+        SmartExecutionMode::all()
+            .get(self.execution_mode_index)
+            .copied()
+            .unwrap_or(SmartExecutionMode::Direct)
     }
 }
 
@@ -481,6 +543,7 @@ async fn build_preview(
     context: &SmartContext<'_>,
     provider: String,
     model: String,
+    execution_mode: SmartExecutionMode,
 ) -> Result<SmartPreview> {
     let target_config = load_runtime_config(
         None,
@@ -494,6 +557,7 @@ async fn build_preview(
     let selection = SmartSelection {
         provider,
         model,
+        execution_mode,
         target_context_window: target_config.model_context_window,
         target_auto_compact_token_limit: target_config.model_auto_compact_token_limit,
         target_config,
@@ -524,6 +588,7 @@ fn plan_preview(
     });
     let current_context_tokens = summary.latest_context_tokens;
     let current_context_window = summary.latest_model_context_window;
+    let execution_mode = selection.execution_mode;
     let needs_compaction = selection
         .target_context_window
         .zip(current_context_tokens)
@@ -532,14 +597,22 @@ fn plan_preview(
         .should_repair_resume_state(current_model, current_context_window)
         && selection.target_context_window.is_some();
     let same_provider = selection.provider == current_provider;
-    let strategy = match (same_provider, needs_compaction, needs_repair_resume_state) {
-        (true, false, false) => SmartStrategy::SameThreadProfileOnly,
-        (true, false, true) => SmartStrategy::SameThreadRepair,
-        (true, true, _) => SmartStrategy::SameThreadRepairAfterCompaction,
-        (false, false, _) => SmartStrategy::CrossProviderMigrate,
-        (false, true, _) => SmartStrategy::CrossProviderMigrateAfterCompaction,
+    let strategy = match execution_mode {
+        SmartExecutionMode::Distill => SmartStrategy::DistillSuccessor,
+        SmartExecutionMode::Direct => {
+            match (same_provider, needs_compaction, needs_repair_resume_state) {
+                (true, false, false) => SmartStrategy::SameThreadProfileOnly,
+                (true, false, true) => SmartStrategy::SameThreadRepair,
+                (true, true, _) => SmartStrategy::SameThreadRepairAfterCompaction,
+                (false, false, _) => SmartStrategy::CrossProviderMigrate,
+                (false, true, _) => SmartStrategy::CrossProviderMigrateAfterCompaction,
+            }
+        }
     };
-    let blocked_reason = if summary.archived && needs_compaction {
+    let blocked_reason = if summary.archived
+        && needs_compaction
+        && execution_mode == SmartExecutionMode::Direct
+    {
         Some(match same_provider {
             true => match selection.target_context_window {
                 Some(target_window) => format!(
@@ -608,6 +681,7 @@ fn strategy_label(strategy: SmartStrategy) -> &'static str {
         SmartStrategy::SameThreadRepairAfterCompaction => "same-thread compact then repair",
         SmartStrategy::CrossProviderMigrate => "cross-provider migrate",
         SmartStrategy::CrossProviderMigrateAfterCompaction => "cross-provider compact then migrate",
+        SmartStrategy::DistillSuccessor => "distill successor session",
     }
 }
 
@@ -618,6 +692,7 @@ fn strategy_label_zh(strategy: SmartStrategy) -> &'static str {
         SmartStrategy::SameThreadRepairAfterCompaction => "同线程先压缩再修复",
         SmartStrategy::CrossProviderMigrate => "跨 provider 迁移",
         SmartStrategy::CrossProviderMigrateAfterCompaction => "跨 provider 先压缩再迁移",
+        SmartStrategy::DistillSuccessor => "提炼轻量继任会话",
     }
 }
 
@@ -705,6 +780,10 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
             SmartStep::Model => match picker.language {
                 PickerLanguage::English => "Select model",
                 PickerLanguage::Chinese => "选择 model",
+            },
+            SmartStep::Mode => match picker.language {
+                PickerLanguage::English => "Select execution mode",
+                PickerLanguage::Chinese => "选择执行模式",
             },
             SmartStep::Confirm => match picker.language {
                 PickerLanguage::English => "Confirm",
@@ -799,6 +878,48 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                 .collect::<Vec<_>>();
             frame.render_widget(List::new(items), list_inner);
         }
+        SmartStep::Mode => {
+            let items = SmartExecutionMode::all()
+                .iter()
+                .enumerate()
+                .map(|(index, mode)| {
+                    let (title, description) = match (picker.language, mode) {
+                        (PickerLanguage::English, SmartExecutionMode::Direct) => (
+                            "Direct switch",
+                            "Repair or migrate the selected thread directly",
+                        ),
+                        (PickerLanguage::English, SmartExecutionMode::Distill) => (
+                            "Distill successor",
+                            "Create a lighter successor session and continue there",
+                        ),
+                        (PickerLanguage::Chinese, SmartExecutionMode::Direct) => {
+                            ("直接切换", "直接在当前线程上修复或迁移")
+                        }
+                        (PickerLanguage::Chinese, SmartExecutionMode::Distill) => {
+                            ("提炼继任会话", "生成一个更轻的新会话并转到那里继续工作")
+                        }
+                    };
+                    let line = if index == picker.execution_mode_index {
+                        Line::from(vec![
+                            "› ".green().bold(),
+                            title.bold(),
+                            " · ".dim(),
+                            description.into(),
+                        ])
+                        .reversed()
+                    } else {
+                        Line::from(vec![
+                            "  ".into(),
+                            title.into(),
+                            " · ".dim(),
+                            description.into(),
+                        ])
+                    };
+                    ListItem::new(line)
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(List::new(items), list_inner);
+        }
         SmartStep::Confirm => {
             let preview = picker.preview.as_ref();
             let lines = vec![
@@ -874,6 +995,24 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                     (PickerLanguage::Chinese, None) => "目标上下文窗口：".to_string(),
                 }),
                 Line::from(""),
+                Line::from(match (picker.language, preview) {
+                    (PickerLanguage::English, Some(preview)) => format!(
+                        "Execution mode: {}",
+                        match preview.selection.execution_mode {
+                            SmartExecutionMode::Direct => "direct switch",
+                            SmartExecutionMode::Distill => "distill successor",
+                        }
+                    ),
+                    (PickerLanguage::Chinese, Some(preview)) => format!(
+                        "执行模式：{}",
+                        match preview.selection.execution_mode {
+                            SmartExecutionMode::Direct => "直接切换",
+                            SmartExecutionMode::Distill => "提炼继任会话",
+                        }
+                    ),
+                    (PickerLanguage::English, None) => "Execution mode: ".to_string(),
+                    (PickerLanguage::Chinese, None) => "执行模式：".to_string(),
+                }),
                 Line::from(match (picker.language, preview) {
                     (PickerLanguage::English, Some(preview)) => {
                         format!("Strategy: {}", strategy_label(preview.strategy))
@@ -1028,6 +1167,7 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
 
 #[cfg(test)]
 mod tests {
+    use super::SmartExecutionMode;
     use super::SmartSelection;
     use super::SmartStrategy;
     use super::collect_provider_choices;
@@ -1125,6 +1265,7 @@ mod tests {
             SmartSelection {
                 provider: "openai".to_string(),
                 model: "gpt-5.2".to_string(),
+                execution_mode: SmartExecutionMode::Direct,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1177,6 +1318,7 @@ mod tests {
             SmartSelection {
                 provider: "yunyi".to_string(),
                 model: "gpt-5.2".to_string(),
+                execution_mode: SmartExecutionMode::Direct,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1189,5 +1331,53 @@ mod tests {
         );
         assert!(preview.will_archive_source);
         assert!(preview.blocked_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn plan_preview_uses_distill_strategy_when_selected() {
+        let config = sample_config().await;
+        let preview = plan_preview(
+            &SessionSummary {
+                thread_id: "thread-1".to_string(),
+                thread_name: None,
+                rollout_path: "D:/tmp/rollout.jsonl".into(),
+                archived: true,
+                source: "cli".to_string(),
+                session_provider: Some("openai".to_string()),
+                session_cwd: "D:/tmp".into(),
+                session_timestamp: "2026-03-11T00:00:00Z".to_string(),
+                latest_model: Some("gpt-5.4".to_string()),
+                latest_total_tokens: Some(1000),
+                latest_context_tokens: Some(400000),
+                latest_model_context_window: Some(950000),
+                user_turns: 1,
+                first_user_message: None,
+                forked_from_id: None,
+                memory_mode: None,
+            },
+            "openai",
+            "gpt-5.4",
+            &SmartArgs {
+                target: TargetArgs {
+                    target: "thread-1".to_string(),
+                    config_profile: None,
+                },
+                write_profile: Some("distilled".to_string()),
+                archive_source: true,
+                max_pre_compactions: 3,
+                timeout_secs: 300,
+            },
+            SmartSelection {
+                provider: "yunyi".to_string(),
+                model: "gpt-5.2".to_string(),
+                execution_mode: SmartExecutionMode::Distill,
+                target_config: config,
+                target_context_window: Some(258400),
+                target_auto_compact_token_limit: Some(232560),
+            },
+        );
+
+        assert_eq!(preview.strategy, SmartStrategy::DistillSuccessor);
+        assert_eq!(preview.blocked_reason, None);
     }
 }

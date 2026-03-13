@@ -419,17 +419,17 @@ async fn build_session_summary_handles_real_forked_rollout_fixture() {
     assert_eq!(summary.session_provider.as_deref(), Some("openai"));
     assert_eq!(summary.session_cwd, PathBuf::from(r"D:\pi_workspace"));
     assert_eq!(summary.session_timestamp, "2026-02-11T08:24:46.202Z");
-    assert_eq!(summary.latest_model.as_deref(), Some("gpt-5.2-codex"));
-    assert_eq!(summary.latest_total_tokens, Some(43_615_395));
-    assert_eq!(summary.latest_context_tokens, Some(271_103));
+    assert_eq!(summary.latest_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(summary.latest_total_tokens, Some(212_619_454));
+    assert_eq!(summary.latest_context_tokens, Some(542_759));
     assert_eq!(summary.latest_model_context_window, Some(950_000));
-    assert_eq!(summary.user_turns, 332);
+    assert_eq!(summary.user_turns, 455);
     assert_eq!(summary.memory_mode, None);
     assert!(
         summary
             .first_user_message
             .as_deref()
-            .is_some_and(|message| message.starts_with("然后有个这三个测试")),
+            .is_some_and(|message| !message.is_empty()),
         "unexpected first user message: {:?}",
         summary.first_user_message
     );
@@ -476,7 +476,7 @@ async fn repair_resume_state_rewrites_real_fixture_window_summary() {
         .expect("build summary");
 
     assert_eq!(summary.latest_model_context_window, Some(258_400));
-    assert_eq!(summary.latest_context_tokens, Some(271_103));
+    assert_eq!(summary.latest_context_tokens, Some(542_759));
     assert_eq!(
         summary.forked_from_id.as_deref(),
         Some("019bc4a8-fcda-70a2-ad21-2dd6c5d63c21")

@@ -4,7 +4,7 @@ use crate::operations::build_thread_manager;
 use crate::operations::reconcile_rollout_path;
 use crate::operations::resolve_new_rollout_path;
 use crate::operations::shutdown_thread;
-use crate::runtime::load_session_runtime_config;
+use crate::runtime::load_runtime_config;
 use crate::runtime::render_profiled_resume_command;
 use crate::runtime::resolve_target;
 use crate::runtime::write_profile_from_config;
@@ -51,11 +51,15 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         args.recent_turns,
     );
     let brief = build_distilled_brief(&summary, &analysis);
+    let successor_thread_name =
+        default_distilled_thread_name(&summary, args.thread_name.as_deref())?;
+    let target_runtime_config = load_distill_runtime_config(&args, &summary).await?;
     let report = build_report(
         &summary,
         &analysis,
         brief.as_str(),
-        default_distilled_thread_name(&summary, args.thread_name.as_deref())?,
+        successor_thread_name.clone(),
+        &target_runtime_config,
     );
 
     if args.preview_only {
@@ -72,8 +76,7 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         );
     }
 
-    let runtime_config =
-        load_session_runtime_config(args.target.config_profile.clone(), &summary).await?;
+    let runtime_config = target_runtime_config;
     if let Some(profile) = args.write_profile.as_deref() {
         write_profile_from_config(profile, &runtime_config).await?;
     }
@@ -87,7 +90,7 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         .context("failed to start distilled successor thread")?;
     let successor_rollout_path =
         resolve_new_rollout_path(&runtime_config, &new_thread.thread, new_thread.thread_id).await?;
-    let successor_name = report.successor_thread_name.clone();
+    let successor_name = successor_thread_name;
     append_thread_name(
         &runtime_config.codex_home,
         new_thread.thread_id,
@@ -179,6 +182,9 @@ struct DistillReport {
     source_context_tokens_estimate: Option<i64>,
     source_context_window: Option<i64>,
     source_user_turns: usize,
+    successor_provider: String,
+    successor_model: String,
+    successor_context_window: Option<i64>,
     successor_thread_name: String,
     successor_seed_tokens_estimate: usize,
     compression_ratio: Option<f64>,
@@ -443,6 +449,7 @@ fn build_report(
     analysis: &DistillAnalysis,
     brief: &str,
     successor_thread_name: String,
+    target_runtime_config: &codex_core::config::Config,
 ) -> DistillReport {
     let successor_seed_tokens_estimate = approx_token_count(brief);
     let compression_ratio = summary.latest_context_tokens.and_then(|source_tokens| {
@@ -458,6 +465,9 @@ fn build_report(
         source_context_tokens_estimate: summary.latest_context_tokens,
         source_context_window: summary.latest_model_context_window,
         source_user_turns: summary.user_turns,
+        successor_provider: target_runtime_config.model_provider_id.clone(),
+        successor_model: target_runtime_config.model.clone().unwrap_or_default(),
+        successor_context_window: target_runtime_config.model_context_window,
         successor_thread_name,
         successor_seed_tokens_estimate,
         compression_ratio,
@@ -467,6 +477,21 @@ fn build_report(
         errors_kept: analysis.recent_errors.len(),
         had_compaction_summary: analysis.latest_compaction_summary.is_some(),
     }
+}
+
+async fn load_distill_runtime_config(
+    args: &DistillArgs,
+    summary: &crate::types::SessionSummary,
+) -> Result<codex_core::config::Config> {
+    load_runtime_config(
+        args.target.config_profile.clone(),
+        Some(summary.session_cwd.clone()),
+        args.model.clone().or(summary.latest_model.clone()),
+        args.provider.clone().or(summary.session_provider.clone()),
+        args.context_window.or(summary.latest_model_context_window),
+        args.auto_compact_token_limit,
+    )
+    .await
 }
 
 fn print_output(output: DistillOutput, json: bool) -> Result<()> {
@@ -497,6 +522,15 @@ fn print_output(output: DistillOutput, json: bool) -> Result<()> {
         output
             .report
             .source_context_tokens_estimate
+            .map_or_else(String::new, |value| value.to_string())
+    );
+    println!("successor_provider: {}", output.report.successor_provider);
+    println!("successor_model: {}", output.report.successor_model);
+    println!(
+        "successor_context_window: {}",
+        output
+            .report
+            .successor_context_window
             .map_or_else(String::new, |value| value.to_string())
     );
     println!(
@@ -653,6 +687,7 @@ mod tests {
     use super::build_distilled_brief;
     use super::build_report;
     use crate::types::SessionSummary;
+    use codex_core::config::ConfigBuilder;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::CompactedItem;
@@ -661,6 +696,7 @@ mod tests {
     use codex_protocol::protocol::RolloutLine;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn response_message(role: &str, text: &str) -> ResponseItem {
         ResponseItem::Message {
@@ -699,6 +735,15 @@ mod tests {
             forked_from_id: None,
             memory_mode: None,
         }
+    }
+
+    async fn target_runtime_config() -> codex_core::config::Config {
+        let temp = tempdir().expect("tempdir");
+        ConfigBuilder::default()
+            .codex_home(temp.path().to_path_buf())
+            .build()
+            .await
+            .expect("build config")
     }
 
     #[test]
@@ -771,11 +816,15 @@ mod tests {
             recent_errors: vec![],
         };
         let brief = "abcd".repeat(400);
+        let runtime = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(target_runtime_config());
         let report = build_report(
             &summary(),
             &analysis,
             brief.as_str(),
             "Distilled".to_string(),
+            &runtime,
         );
         assert_eq!(
             report.successor_seed_tokens_estimate,
@@ -783,5 +832,6 @@ mod tests {
         );
         assert!(report.compression_ratio.is_some());
         assert_eq!(report.successor_thread_name, "Distilled");
+        assert_eq!(report.successor_provider, "openai");
     }
 }
