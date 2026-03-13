@@ -21,9 +21,11 @@
 对话加载不出来了？CSM 可以一键帮你从底层历史记录中重建并修复对话状态。
 2. **🚚 无痛换模型/服务商 (Provider Migration)**
 想把当前的对话无缝切换到另一个大模型（比如换到拥有更大上下文的模型）？CSM 提供引导式的“搬家”服务，不丢失历史记录。
-3. **🔍 历史对话透视镜 (Inspection)**
+3. **🧳 轻量继任会话 (Distill)**
+当一个长期沿用的项目对话变得越来越重、越来越难恢复时，CSM 可以把它的有效历史提炼成一个更轻的新会话，显著降低冷启动成本。
+4. **🔍 历史对话透视镜 (Inspection)**
 清晰地看到每个对话到底用了哪个模型、消耗了多少 Token、当前的上下文占用量是多少。
-4. **🛡️ 绝对安全 (Safe-by-default)**
+5. **🛡️ 绝对安全 (Safe-by-default)**
 CSM 的所有操作都遵循 Codex 原生规则，不会强行篡改或损坏你的原始聊天记录。
 
 ---
@@ -38,6 +40,13 @@ CSM 的所有操作都遵循 Codex 原生规则，不会强行篡改或损坏你
 # 启动智能向导，<ID> 替换为你的对话ID或路径
 cargo run -- smart <对话的ID或路径>
 
+```
+
+如果你的核心问题是“一个项目长期共用一个会话，结果恢复越来越慢”，
+那就优先使用 `distill`，把旧对话提炼成一个更轻的继任会话：
+
+```powershell
+cargo run -- distill <对话的ID或路径>
 ```
 
 ---
@@ -76,6 +85,7 @@ cargo run -- smart <对话的ID或路径>
 * **分支对话 (Fork)**：`cargo run -- fork <ID> --provider openrouter --model gpt-5` （基于当前对话分出一个新对话，并使用新模型）
 * **瘦身压缩 (Compact)**：`cargo run -- compact <ID>` （压缩对话历史，释放上下文空间）
 * **手动迁移 (Migrate)**：`cargo run -- migrate <ID> --provider ...` （专为从大窗口模型迁移到小窗口模型设计，会自动帮你压缩并分支）
+* **提炼轻量继任会话 (Distill)**：`cargo run -- distill <ID>` （生成 deterministic handoff brief，并创建一个更轻的新会话）
 
 ### 🔴 故障急救 (Repair)
 

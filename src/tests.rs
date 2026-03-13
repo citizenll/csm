@@ -130,6 +130,27 @@ fn cli_parses_smart_command() {
 }
 
 #[test]
+fn cli_parses_distill_command() {
+    let cli = crate::Cli::try_parse_from([
+        "codex-session-manager",
+        "distill",
+        "thread-123",
+        "--preview-only",
+        "--recent-turns",
+        "6",
+    ])
+    .expect("parse cli");
+
+    let Some(crate::cli::Command::Distill(args)) = cli.command else {
+        panic!("expected distill command");
+    };
+
+    assert_eq!(args.target.target, "thread-123");
+    assert!(args.preview_only);
+    assert_eq!(args.recent_turns, 6);
+}
+
+#[test]
 fn rewrite_rollout_meta_contents_updates_first_session_meta_line() {
     let thread_id =
         ThreadId::from_string("019cd66f-f4ea-7022-802b-7007c11cea97").expect("thread id");

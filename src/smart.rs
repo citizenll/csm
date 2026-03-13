@@ -461,10 +461,9 @@ async fn list_available_models(config: &Config) -> Result<Vec<ModelPreset>> {
     );
     auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
     let thread_manager = ThreadManager::new(
-        config.codex_home.clone(),
+        config,
         auth_manager,
         SessionSource::Exec,
-        config.model_catalog.clone(),
         CollaborationModesConfig {
             default_mode_request_user_input: config
                 .features

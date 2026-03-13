@@ -173,6 +173,7 @@ pub(crate) async fn compact_rollout_once(
             config.clone(),
             rollout_path.to_path_buf(),
             Arc::clone(&auth_manager),
+            None,
         )
         .await
         .with_context(|| format!("failed to resume {}", rollout_path.display()))?;
@@ -208,6 +209,7 @@ pub(crate) async fn rollback_rollout_once(
             config.clone(),
             rollout_path.to_path_buf(),
             Arc::clone(&auth_manager),
+            None,
         )
         .await
         .with_context(|| format!("failed to resume {}", rollout_path.display()))?;
@@ -270,6 +272,7 @@ pub(crate) async fn fork_rollout_path(request: ForkRequest) -> Result<ForkOutcom
             target_config.clone(),
             source_rollout_path,
             persist_extended_history,
+            None,
         )
         .await
         .context("failed to fork rollout")?;
@@ -354,7 +357,7 @@ async fn touch_rollout_path(path: &Path) -> Result<()> {
     .context("touch task panicked")?
 }
 
-fn build_thread_manager(
+pub(crate) fn build_thread_manager(
     config: &Config,
     session_source: SessionSource,
 ) -> (Arc<ThreadManager>, Arc<AuthManager>) {
@@ -365,10 +368,9 @@ fn build_thread_manager(
     );
     auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
     let thread_manager = Arc::new(ThreadManager::new(
-        config.codex_home.clone(),
+        config,
         Arc::clone(&auth_manager),
         session_source,
-        config.model_catalog.clone(),
         CollaborationModesConfig {
             default_mode_request_user_input: config
                 .features
@@ -378,7 +380,7 @@ fn build_thread_manager(
     (thread_manager, auth_manager)
 }
 
-async fn resolve_new_rollout_path(
+pub(crate) async fn resolve_new_rollout_path(
     config: &Config,
     thread: &Arc<codex_core::CodexThread>,
     thread_id: ThreadId,
@@ -422,7 +424,7 @@ async fn wait_for_operation_completion(
         .with_context(|| format!("timed out waiting for operation `{submit_id}`"))?
 }
 
-async fn shutdown_thread(
+pub(crate) async fn shutdown_thread(
     thread_manager: &Arc<ThreadManager>,
     thread_id: ThreadId,
     thread: &Arc<codex_core::CodexThread>,

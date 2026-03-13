@@ -54,6 +54,8 @@ pub(crate) enum Command {
     Migrate(MigrateArgs),
     /// Interactive smart provider/model switch workflow.
     Smart(SmartArgs),
+    /// Distill a heavy session into a lighter successor session.
+    Distill(DistillArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -261,6 +263,40 @@ pub(crate) struct SmartArgs {
     pub(crate) max_pre_compactions: u32,
 
     /// Maximum seconds to wait for each compaction step.
+    #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
+    pub(crate) timeout_secs: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct DistillArgs {
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+
+    /// Optional thread name for the distilled successor session.
+    #[arg(long)]
+    pub(crate) thread_name: Option<String>,
+
+    /// Persist the successor runtime into this config profile.
+    #[arg(long)]
+    pub(crate) write_profile: Option<String>,
+
+    /// Archive the source rollout after a successful distillation.
+    #[arg(long, default_value_t = false)]
+    pub(crate) archive_source: bool,
+
+    /// Show the distillation report without creating a successor thread.
+    #[arg(long, default_value_t = false)]
+    pub(crate) preview_only: bool,
+
+    /// Emit structured JSON instead of plain text output.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+
+    /// Number of recent user turns to preserve in the deterministic brief.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) recent_turns: usize,
+
+    /// Maximum seconds to wait for the seed handoff turn to complete.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub(crate) timeout_secs: u64,
 }

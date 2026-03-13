@@ -8,6 +8,7 @@ use crate::cli::RewriteMetaArgs;
 use crate::cli::RollbackArgs;
 use crate::cli::ShowArgs;
 use crate::cli::TargetArgs;
+use crate::distill;
 use crate::operations::archive_rollout_file;
 use crate::operations::compact_rollout_once;
 use crate::operations::fork_rollout_path;
@@ -56,6 +57,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         Command::Rollback(args) => rollback_session(args).await,
         Command::Migrate(args) => migrate_session(args).await,
         Command::Smart(args) => smart::run(args).await,
+        Command::Distill(args) => distill::run(args).await,
     }
 }
 

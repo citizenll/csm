@@ -20,9 +20,11 @@ It provides a highly intuitive visual interface (TUI) and simple command-line to
 Conversation refusing to load? CSM can help you rebuild and repair the session state directly from your underlying history logs with a single click.
 2. **🚚 Painless Model/Provider Switching (Migration)**
 Want to seamlessly move your current chat to a different AI model (like one with a larger context window)? CSM offers a guided "moving service" so you don't lose your place.
-3. **🔍 Chat History X-Ray (Inspection)**
+3. **🧳 Lightweight Successor Sessions (Distill)**
+When one long-lived project thread becomes expensive to reopen, CSM can distill its effective history into a lighter successor session with a much smaller cold-start footprint.
+4. **🔍 Chat History X-Ray (Inspection)**
 Get a clear, transparent view of every thread: see exactly which model was used, how many tokens were consumed, and your current context footprint.
-4. **🛡️ Completely Safe (Safe-by-default)**
+5. **🛡️ Completely Safe (Safe-by-default)**
 Every operation in CSM strictly follows native Codex rules. It will never blindly rewrite history or corrupt your original chat logs.
 
 ---
@@ -37,6 +39,14 @@ If you don't want to memorize complex commands, you only need to remember one: `
 # Launch the smart wizard (replace <ID> with your thread ID or path)
 cargo run -- smart <thread-id-or-path>
 
+```
+
+If your main problem is that a single project thread has become too heavy to
+resume efficiently, use `distill` to generate a lighter successor session from
+the source thread's effective history:
+
+```powershell
+cargo run -- distill <thread-id-or-path>
 ```
 
 ---
@@ -75,6 +85,7 @@ For those who prefer the command line, CSM offers a rich set of direct commands:
 * **Branch a thread (Fork)**: `cargo run -- fork <ID> --provider openrouter --model gpt-5` (Creates a new thread from the current one using a new model)
 * **Slim down history (Compact)**: `cargo run -- compact <ID>` (Compresses chat history to free up context space)
 * **Manual Migration**: `cargo run -- migrate <ID> --provider ...` (Designed for moving from large-window models to smaller ones; automatically compacts and forks)
+* **Create a distilled successor**: `cargo run -- distill <ID>` (Builds a deterministic handoff brief and starts a lighter successor session)
 
 ### 🔴 Emergency Repair
 

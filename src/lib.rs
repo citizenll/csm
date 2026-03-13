@@ -5,6 +5,7 @@
 
 mod cli;
 mod commands;
+mod distill;
 mod operations;
 mod rollout_edit;
 mod runtime;

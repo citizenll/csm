@@ -326,6 +326,7 @@ enum Action {
     Rollback,
     Migrate,
     Smart,
+    Distill,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -719,6 +720,7 @@ impl Action {
             Action::Rollback,
             Action::Migrate,
             Action::Smart,
+            Action::Distill,
         ]
     }
 
@@ -740,6 +742,7 @@ impl Action {
             Action::Rollback => "rollback",
             Action::Migrate => "migrate",
             Action::Smart => "smart",
+            Action::Distill => "distill",
         }
     }
 
@@ -773,6 +776,9 @@ impl Action {
             (Action::Smart, Language::English) => {
                 "Guided provider/model switch with automatic runtime repair"
             }
+            (Action::Distill, Language::English) => {
+                "Create a lighter successor session from a heavy source thread"
+            }
             (Action::Show, Language::Chinese) => "查看这个线程的派生摘要信息",
             (Action::Rename, Language::Chinese) => "向 session_index.jsonl 追加新的线程标题",
             (Action::Repair, Language::Chinese) => "根据 rollout 历史修复 SQLite 元数据",
@@ -793,6 +799,7 @@ impl Action {
             (Action::Smart, Language::Chinese) => {
                 "通过向导切换 provider/model，并自动修复运行时状态"
             }
+            (Action::Distill, Language::Chinese) => "从重会话里提炼出一个更轻的继任会话",
         }
     }
 
@@ -814,6 +821,7 @@ impl Action {
             Action::Rollback => ActionInputKind::Raw { required: true },
             Action::Migrate => ActionInputKind::Raw { required: false },
             Action::Smart => ActionInputKind::None,
+            Action::Distill => ActionInputKind::Raw { required: false },
         }
     }
 
@@ -833,6 +841,7 @@ impl Action {
             (Action::Migrate, _) => Some(
                 "--provider yunyi --model gpt-5.2 --context-window 258400 --write-profile yunyi-256k --archive-source",
             ),
+            (Action::Distill, _) => Some("--preview-only"),
             (Action::Show, _)
             | (Action::Repair, _)
             | (Action::Archive, _)
