@@ -1205,6 +1205,7 @@ mod tests {
             reconstructed_history: reconstructed_items.clone(),
             history_items_count: reconstructed_items.len(),
             history_tokens_estimate: 100,
+            base_instructions_tokens_estimate: 0,
             previous_turn_model: Some("gpt-5.4".to_string()),
             reference_context_item: None,
             context_strategy: NextTurnContextStrategy::FullInitialContext {

@@ -10,8 +10,11 @@ use codex_core::RolloutRecorder;
 use codex_core::features::Feature;
 use codex_core::parse_turn_item;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TurnContextItem;
 use serde::Serialize;
@@ -47,6 +50,7 @@ pub(crate) async fn execute(args: FirstTokenPreviewArgs) -> Result<FirstTokenPre
     let preview = build_prompt_preview_snapshot(
         &summary,
         &runtime_config,
+        &history,
         rollout_items.as_slice(),
         args.input.as_deref(),
     )
@@ -72,7 +76,14 @@ pub(crate) async fn build_prompt_preview_for_distill(
             )
         })?;
     let rollout_items = history.get_rollout_items();
-    build_prompt_preview_snapshot(&summary, &runtime_config, rollout_items.as_slice(), None).await
+    build_prompt_preview_snapshot(
+        &summary,
+        &runtime_config,
+        &history,
+        rollout_items.as_slice(),
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +91,7 @@ pub(crate) struct PromptPreviewSnapshot {
     pub(crate) reconstructed_history: Vec<ResponseItem>,
     pub(crate) history_items_count: usize,
     pub(crate) history_tokens_estimate: usize,
+    pub(crate) base_instructions_tokens_estimate: usize,
     pub(crate) previous_turn_model: Option<String>,
     pub(crate) reference_context_item: Option<TurnContextItem>,
     pub(crate) context_strategy: NextTurnContextStrategy,
@@ -136,6 +148,9 @@ pub(crate) struct FirstTokenPreviewOutput {
     next_user_input: Option<String>,
     reconstructed_history_items: usize,
     reconstructed_history_tokens_estimate: usize,
+    base_instructions_tokens_estimate: usize,
+    next_turn_extras_tokens_estimate: usize,
+    estimated_full_request_without_tools: usize,
     previous_turn_model: Option<String>,
     reference_context_item_present: bool,
     next_turn_context_strategy: NextTurnContextStrategy,
@@ -167,6 +182,21 @@ impl FirstTokenPreviewOutput {
             next_user_input,
             reconstructed_history_items: snapshot.history_items_count,
             reconstructed_history_tokens_estimate: snapshot.history_tokens_estimate,
+            base_instructions_tokens_estimate: snapshot.base_instructions_tokens_estimate,
+            next_turn_extras_tokens_estimate: snapshot
+                .prompt_sections
+                .iter()
+                .filter(|section| section.kind != "reconstructed_history")
+                .map(|section| section.estimated_tokens)
+                .sum(),
+            estimated_full_request_without_tools: snapshot.history_tokens_estimate
+                + snapshot.base_instructions_tokens_estimate
+                + snapshot
+                    .prompt_sections
+                    .iter()
+                    .filter(|section| section.kind != "reconstructed_history")
+                    .map(|section| section.estimated_tokens)
+                    .sum::<usize>(),
             previous_turn_model: snapshot.previous_turn_model,
             reference_context_item_present: snapshot.reference_context_item.is_some(),
             next_turn_context_strategy: snapshot.context_strategy,
@@ -222,6 +252,19 @@ pub(crate) fn render_output_lines(output: &FirstTokenPreviewOutput) -> Vec<Strin
             "reconstructed_history_tokens_estimate: {}",
             output.reconstructed_history_tokens_estimate
         ),
+        format!(
+            "base_instructions_tokens_estimate: {}",
+            output.base_instructions_tokens_estimate
+        ),
+        format!(
+            "next_turn_extras_tokens_estimate: {}",
+            output.next_turn_extras_tokens_estimate
+        ),
+        format!(
+            "estimated_full_request_without_tools: {}",
+            output.estimated_full_request_without_tools
+        ),
+        "estimate_scope: includes reconstructed history + base instructions + next-turn extras, but still excludes tool schema payloads".to_string(),
     ];
     if let Some(summary) = output.latest_compaction_summary.as_deref() {
         lines.push(String::new());
@@ -338,10 +381,20 @@ struct ActiveReplaySegment<'a> {
 async fn build_prompt_preview_snapshot(
     summary: &SessionSummary,
     runtime_config: &codex_core::config::Config,
+    initial_history: &InitialHistory,
     rollout_items: &[RolloutItem],
     next_user_input: Option<&str>,
 ) -> Result<PromptPreviewSnapshot> {
     let reconstruction = reconstruct_rollout_history(rollout_items);
+    let base_instructions = runtime_config
+        .base_instructions
+        .clone()
+        .or_else(|| {
+            initial_history
+                .get_base_instructions()
+                .map(|instructions| instructions.text)
+        })
+        .unwrap_or_default();
     let current_model = runtime_config
         .model
         .clone()
@@ -367,11 +420,15 @@ async fn build_prompt_preview_snapshot(
             "{} model-visible history item(s) reconstructed from rollout replay",
             reconstruction.history.len()
         ),
-        estimated_tokens: summary
-            .latest_context_tokens
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or_else(|| estimate_response_items_tokens(reconstruction.history.as_slice())),
+        estimated_tokens: estimate_response_items_tokens(reconstruction.history.as_slice()),
     }];
+    if !base_instructions.trim().is_empty() {
+        prompt_sections.push(PromptSectionPreview {
+            kind: "base_instructions".to_string(),
+            description: "session base instructions resolved for the next request".to_string(),
+            estimated_tokens: approx_token_count(base_instructions.as_str()),
+        });
+    }
     let context_strategy = if reconstruction.reference_context_item.is_none() {
         prompt_sections.push(PromptSectionPreview {
             kind: "initial_context".to_string(),
@@ -454,10 +511,8 @@ async fn build_prompt_preview_snapshot(
     Ok(PromptPreviewSnapshot {
         reconstructed_history: reconstruction.history.clone(),
         history_items_count: reconstruction.history.len(),
-        history_tokens_estimate: summary
-            .latest_context_tokens
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or_else(|| estimate_response_items_tokens(reconstruction.history.as_slice())),
+        history_tokens_estimate: estimate_response_items_tokens(reconstruction.history.as_slice()),
+        base_instructions_tokens_estimate: approx_token_count(base_instructions.as_str()),
         previous_turn_model: reconstruction
             .previous_turn_settings
             .map(|settings| settings.model),
@@ -1002,9 +1057,75 @@ fn estimate_response_items_tokens(items: &[ResponseItem]) -> usize {
 }
 
 fn estimate_response_item_tokens(item: &ResponseItem) -> usize {
-    serde_json::to_string(item)
-        .map(|serialized| approx_token_count(serialized.as_str()))
+    let bytes = estimate_response_item_model_visible_bytes(item);
+    bytes.saturating_add(3).checked_div(4).unwrap_or(0)
+}
+
+fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> usize {
+    match item {
+        ResponseItem::GhostSnapshot { .. } => 0,
+        ResponseItem::Reasoning {
+            encrypted_content: Some(content),
+            ..
+        }
+        | ResponseItem::Compaction {
+            encrypted_content: content,
+        } => estimate_reasoning_length(content.len()),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            if let FunctionCallOutputBody::ContentItems(items) = &output.body {
+                let image_count = items
+                    .iter()
+                    .filter(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
+                    .count();
+                let raw = serde_json::to_string(item).map_or(0, |serialized| serialized.len());
+                if image_count == 0 {
+                    raw
+                } else {
+                    raw.saturating_sub(
+                        items
+                            .iter()
+                            .map(|item| {
+                                serde_json::to_string(item).map_or(0, |serialized| serialized.len())
+                            })
+                            .sum::<usize>(),
+                    )
+                    .saturating_add(image_count.saturating_mul(7_373))
+                }
+            } else {
+                serde_json::to_string(item).map_or(0, |serialized| serialized.len())
+            }
+        }
+        ResponseItem::Message { content, .. } => {
+            let image_count = content
+                .iter()
+                .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+                .count();
+            let raw = serde_json::to_string(item).map_or(0, |serialized| serialized.len());
+            if image_count == 0 {
+                raw
+            } else {
+                raw.saturating_sub(
+                    content
+                        .iter()
+                        .map(|item| {
+                            serde_json::to_string(item).map_or(0, |serialized| serialized.len())
+                        })
+                        .sum::<usize>(),
+                )
+                .saturating_add(image_count.saturating_mul(7_373))
+            }
+        }
+        _ => serde_json::to_string(item).map_or(0, |serialized| serialized.len()),
+    }
+}
+
+fn estimate_reasoning_length(encoded_len: usize) -> usize {
+    encoded_len
+        .saturating_mul(3)
+        .checked_div(4)
         .unwrap_or(0)
+        .saturating_sub(650)
 }
 
 fn approx_token_count(text: &str) -> usize {
