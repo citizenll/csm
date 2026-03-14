@@ -1,8 +1,12 @@
 use crate::cli::Cli;
 use crate::cli::Command;
+use crate::cli::DistillArgs;
+use crate::cli::SmartArgs;
+use crate::distill;
 use crate::run_command;
 use crate::runtime::load_runtime_config;
 use crate::runtime::shell_quote;
+use crate::smart;
 use crate::summary::build_session_summary;
 use crate::types::SessionSummary;
 use anyhow::Context;
@@ -94,6 +98,105 @@ pub(crate) async fn run() -> Result<()> {
                     execute_prepared_command(&mut terminal, *prepared, app.language).await?;
                 app.status = Some(status);
                 app.reload(selection).await?;
+            }
+            UiEffect::RunSmart(args) => match smart::prepare_execution((*args).clone()).await {
+                Ok(prepared) => {
+                    terminal.suspend()?;
+                    let selection = smart::pick_selection(&prepared).await;
+                    terminal.resume()?;
+                    match selection {
+                        Ok(Some(selection)) => {
+                            app.mode = Mode::Result(smart_processing_result(app.language));
+                            terminal.terminal.clear()?;
+                            terminal.draw(&mut app)?;
+                            match smart::execute_prepared(prepared, selection).await {
+                                Ok(result) => {
+                                    let selection = preferred_selection(
+                                        result.preferred_thread_id.as_deref(),
+                                        result.preferred_rollout_path.as_ref(),
+                                    );
+                                    app.reload(selection).await?;
+                                    app.mode = Mode::Result(ResultViewState {
+                                        title: localize_known_result_title(
+                                            app.language,
+                                            result.title.as_str(),
+                                        ),
+                                        lines: result.lines,
+                                        scroll: 0,
+                                    });
+                                    terminal.terminal.clear()?;
+                                }
+                                Err(error) => {
+                                    app.mode = Mode::Result(error_result_state(
+                                        app.language,
+                                        "Smart Switch Failed",
+                                        "Smart 切换失败",
+                                        &error,
+                                    ));
+                                    terminal.terminal.clear()?;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            app.mode = Mode::Browsing;
+                            app.status = Some(match app.language {
+                                Language::English => "Smart switch cancelled".to_string(),
+                                Language::Chinese => "已取消 smart 切换".to_string(),
+                            });
+                        }
+                        Err(error) => {
+                            app.mode = Mode::Result(error_result_state(
+                                app.language,
+                                "Smart Picker Failed",
+                                "Smart 选择器失败",
+                                &error,
+                            ));
+                            terminal.terminal.clear()?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    app.mode = Mode::Result(error_result_state(
+                        app.language,
+                        "Smart Setup Failed",
+                        "Smart 初始化失败",
+                        &error,
+                    ));
+                    terminal.terminal.clear()?;
+                }
+            },
+            UiEffect::RunDistill(args) => {
+                app.mode = Mode::Result(distill_processing_result(app.language));
+                terminal.terminal.clear()?;
+                terminal.draw(&mut app)?;
+                match distill::execute(*args).await {
+                    Ok(output) => {
+                        let selection = preferred_selection(
+                            output.successor_thread_id.as_deref(),
+                            output.successor_rollout_path.as_ref(),
+                        );
+                        app.reload(selection).await?;
+                        app.mode = Mode::Result(ResultViewState {
+                            title: localized_heading_text(
+                                app.language,
+                                "Distilled Successor Ready",
+                                "提炼结果已生成",
+                            ),
+                            lines: distill::render_output_lines(&output),
+                            scroll: 0,
+                        });
+                        terminal.terminal.clear()?;
+                    }
+                    Err(error) => {
+                        app.mode = Mode::Result(error_result_state(
+                            app.language,
+                            "Distillation Failed",
+                            "提炼失败",
+                            &error,
+                        ));
+                        terminal.terminal.clear()?;
+                    }
+                }
             }
         }
 
@@ -347,6 +450,7 @@ enum Mode {
     Browsing,
     Actions { selected: usize },
     Prompt(PromptState),
+    Result(ResultViewState),
 }
 
 #[derive(Debug)]
@@ -362,6 +466,15 @@ enum UiEffect {
     Quit,
     Reload,
     Execute(Box<PreparedCommand>),
+    RunSmart(Box<SmartArgs>),
+    RunDistill(Box<DistillArgs>),
+}
+
+#[derive(Debug)]
+struct ResultViewState {
+    title: String,
+    lines: Vec<String>,
+    scroll: usize,
 }
 
 struct AppState {
@@ -417,6 +530,7 @@ impl AppState {
             Mode::Browsing => self.handle_browse_key(key),
             Mode::Actions { .. } => self.handle_action_key(key),
             Mode::Prompt(_) => self.handle_prompt_key(key),
+            Mode::Result(_) => self.handle_result_key(key),
         }
     }
 
@@ -446,7 +560,7 @@ impl AppState {
         let actions = self.available_actions();
         let selected_index = match &self.mode {
             Mode::Actions { selected } => *selected,
-            Mode::Browsing | Mode::Prompt(_) => return Ok(UiEffect::None),
+            Mode::Browsing | Mode::Prompt(_) | Mode::Result(_) => return Ok(UiEffect::None),
         };
         let selected_thread = self.selected_entry().cloned();
 
@@ -479,9 +593,11 @@ impl AppState {
                             return Ok(UiEffect::None);
                         };
                         self.mode = Mode::Browsing;
-                        prepare_command(action, &thread, "")
-                            .map(Box::new)
-                            .map(UiEffect::Execute)
+                        let prepared = prepare_command(action, &thread, "")?;
+                        match prepared.command {
+                            Command::Smart(args) => Ok(UiEffect::RunSmart(Box::new(args))),
+                            _ => Ok(UiEffect::Execute(Box::new(prepared))),
+                        }
                     }
                     _ => {
                         self.mode = Mode::Prompt(PromptState {
@@ -518,7 +634,10 @@ impl AppState {
             KeyCode::Enter => match prepare_command(prompt.action, &thread, &prompt.input) {
                 Ok(prepared) => {
                     self.mode = Mode::Browsing;
-                    Ok(UiEffect::Execute(Box::new(prepared)))
+                    match prepared.command {
+                        Command::Distill(args) => Ok(UiEffect::RunDistill(Box::new(args))),
+                        _ => Ok(UiEffect::Execute(Box::new(prepared))),
+                    }
                 }
                 Err(error) => {
                     self.status = Some(self.input_error_message(error.to_string().as_str()));
@@ -529,6 +648,29 @@ impl AppState {
                 prompt.input.push(character);
                 Ok(UiEffect::None)
             }
+            _ => Ok(UiEffect::None),
+        }
+    }
+
+    fn handle_result_key(&mut self, key: KeyEvent) -> Result<UiEffect> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.mode = Mode::Browsing;
+                Ok(UiEffect::None)
+            }
+            KeyCode::Up => {
+                if let Mode::Result(result) = &mut self.mode {
+                    result.scroll = result.scroll.saturating_sub(1);
+                }
+                Ok(UiEffect::None)
+            }
+            KeyCode::Down => {
+                if let Mode::Result(result) = &mut self.mode {
+                    result.scroll = result.scroll.saturating_add(1);
+                }
+                Ok(UiEffect::None)
+            }
+            KeyCode::Char('q') => Ok(UiEffect::Quit),
             _ => Ok(UiEffect::None),
         }
     }
@@ -1083,6 +1225,11 @@ impl Drop for TerminalSession {
 }
 
 fn draw_app(frame: &mut Frame<'_>, app: &mut AppState) {
+    if let Mode::Result(result) = &app.mode {
+        draw_result_page(frame, app, result);
+        return;
+    }
+
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1106,6 +1253,7 @@ fn draw_app(frame: &mut Frame<'_>, app: &mut AppState) {
         Mode::Actions { selected } => draw_actions_overlay(frame, app, *selected),
         Mode::Prompt(prompt) => draw_prompt_overlay(frame, app, prompt),
         Mode::Browsing => {}
+        Mode::Result(_) => {}
     }
 }
 
@@ -1520,6 +1668,181 @@ fn action_window(selected: usize, total: usize, visible_rows: usize) -> (usize, 
     (start, end)
 }
 
+fn preferred_selection(
+    thread_id: Option<&str>,
+    rollout_path: Option<&PathBuf>,
+) -> Option<ThreadIdentity> {
+    thread_id
+        .and_then(|id| ThreadId::from_string(id).ok())
+        .map(|thread_id| ThreadIdentity {
+            thread_id: Some(thread_id),
+            rollout_path: rollout_path.cloned().unwrap_or_default(),
+        })
+        .or_else(|| {
+            rollout_path.cloned().map(|rollout_path| ThreadIdentity {
+                thread_id: None,
+                rollout_path,
+            })
+        })
+}
+
+fn smart_processing_result(language: Language) -> ResultViewState {
+    ResultViewState {
+        title: localized_heading_text(
+            language,
+            "Smart Switch In Progress",
+            "Smart 切换进行中",
+        ),
+        lines: vec![match language {
+            Language::English => {
+                "Executing the selected smart workflow. This may compact, repair, migrate, or distill before the final result page appears.".to_string()
+            }
+            Language::Chinese => {
+                "正在执行已选择的 smart 流程。它可能会进行压缩、修复、迁移或提炼，完成后会停留在结果页。".to_string()
+            }
+        }],
+        scroll: 0,
+    }
+}
+
+fn distill_processing_result(language: Language) -> ResultViewState {
+    ResultViewState {
+        title: localized_heading_text(language, "Distillation In Progress", "提炼进行中"),
+        lines: vec![match language {
+            Language::English => {
+                "Building a successor-session handoff. Codex-backed distillation may take longer than deterministic mode.".to_string()
+            }
+            Language::Chinese => {
+                "正在生成继任会话 handoff。Codex 提炼模式通常会比规则提炼更慢。".to_string()
+            }
+        }],
+        scroll: 0,
+    }
+}
+
+fn error_result_state(
+    language: Language,
+    english_title: &str,
+    chinese_title: &str,
+    error: &anyhow::Error,
+) -> ResultViewState {
+    let mut lines = vec![match language {
+        Language::English => "The operation failed. Error chain:".to_string(),
+        Language::Chinese => "操作失败。错误链如下：".to_string(),
+    }];
+    lines.extend(error.chain().enumerate().map(|(index, cause)| {
+        if index == 0 {
+            format!("1. {cause}")
+        } else {
+            format!("{}. caused by: {cause}", index + 1)
+        }
+    }));
+    ResultViewState {
+        title: localized_heading_text(language, english_title, chinese_title),
+        lines,
+        scroll: 0,
+    }
+}
+
+fn localize_known_result_title(language: Language, english_title: &str) -> String {
+    match language {
+        Language::English => english_title.to_string(),
+        Language::Chinese => match english_title {
+            "Smart Switch Completed" => "Smart 切换完成".to_string(),
+            "Distilled Successor Ready" => "提炼结果已生成".to_string(),
+            other => other.to_string(),
+        },
+    }
+}
+
+fn draw_result_page(frame: &mut Frame<'_>, app: &AppState, result: &ResultViewState) {
+    frame.render_widget(Clear, frame.area());
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    let header_block = Block::default()
+        .title(match app.language {
+            Language::English => "Result",
+            Language::Chinese => "结果",
+        })
+        .borders(Borders::ALL);
+    let header_inner = header_block.inner(areas[0]);
+    frame.render_widget(header_block, areas[0]);
+    frame.render_widget(Paragraph::new(result.title.clone()), header_inner);
+
+    let body_block = Block::default()
+        .title(match app.language {
+            Language::English => "Output",
+            Language::Chinese => "输出",
+        })
+        .borders(Borders::ALL);
+    let body_inner = body_block.inner(areas[1]);
+    frame.render_widget(body_block, areas[1]);
+    if body_inner.height == 0 {
+        return;
+    }
+    let visible_rows = body_inner.height as usize;
+    let start = result
+        .scroll
+        .min(result.lines.len().saturating_sub(visible_rows));
+    let end = (start + visible_rows).min(result.lines.len());
+    let lines = result.lines[start..end]
+        .iter()
+        .cloned()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body_inner);
+
+    let footer_block = Block::default()
+        .title(match app.language {
+            Language::English => "Keys",
+            Language::Chinese => "按键",
+        })
+        .borders(Borders::ALL);
+    let footer_inner = footer_block.inner(areas[2]);
+    frame.render_widget(footer_block, areas[2]);
+    let footer_lines = vec![
+        Line::from(match app.language {
+            Language::English => "↑/↓ scroll · Enter/Esc back to list · q quit".to_string(),
+            Language::Chinese => "↑/↓ 滚动 · Enter/Esc 返回列表 · q 退出".to_string(),
+        }),
+        Line::from(match app.language {
+            Language::English => {
+                if result.lines.is_empty() {
+                    "No output lines".to_string()
+                } else {
+                    format!(
+                        "Showing lines {}-{} of {}",
+                        start + 1,
+                        end,
+                        result.lines.len()
+                    )
+                }
+            }
+            Language::Chinese => {
+                if result.lines.is_empty() {
+                    "当前没有输出行".to_string()
+                } else {
+                    format!(
+                        "当前显示第 {}-{} 行，共 {} 行",
+                        start + 1,
+                        end,
+                        result.lines.len()
+                    )
+                }
+            }
+        })
+        .dim(),
+    ];
+    frame.render_widget(Paragraph::new(footer_lines), footer_inner);
+}
+
 fn draw_prompt_overlay(frame: &mut Frame<'_>, app: &AppState, prompt: &PromptState) {
     let popup = centered_rect(80, 58, frame.area());
     frame.render_widget(Clear, popup);
@@ -1664,6 +1987,13 @@ fn localized_heading(
     match language {
         Language::English => english.bold(),
         Language::Chinese => chinese.bold(),
+    }
+}
+
+fn localized_heading_text(language: Language, english: &str, chinese: &str) -> String {
+    match language {
+        Language::English => english.to_string(),
+        Language::Chinese => chinese.to_string(),
     }
 }
 

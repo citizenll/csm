@@ -31,6 +31,12 @@ use serde::Serialize;
 use std::time::Duration;
 
 pub(crate) async fn run(args: DistillArgs) -> Result<()> {
+    let json = args.json;
+    let output = execute(args).await?;
+    print_output(&output, json)
+}
+
+pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
     if args.recent_turns == 0 {
         bail!("recent_turns must be >= 1");
     }
@@ -61,18 +67,30 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         .await?
         .meta
         .source;
-    let brief = match args.distill_mode {
-        DistillMode::Deterministic => deterministic_brief.clone(),
-        DistillMode::Codex => {
-            run_codex_distillation(
-                &target_runtime_config,
-                session_source,
-                deterministic_brief.as_str(),
-                parse_reasoning_effort(args.reasoning_effort.as_deref())?,
-                args.timeout_secs,
-            )
-            .await?
-        }
+    let (brief, effective_distill_mode, distill_note) = match args.distill_mode {
+        DistillMode::Deterministic => (
+            deterministic_brief.clone(),
+            DistillMode::Deterministic,
+            None,
+        ),
+        DistillMode::Codex => match run_codex_distillation(
+            &target_runtime_config,
+            session_source,
+            deterministic_brief.as_str(),
+            parse_reasoning_effort(args.reasoning_effort.as_deref())?,
+            args.timeout_secs,
+        )
+        .await
+        {
+            Ok(brief) => (brief, DistillMode::Codex, None),
+            Err(error) => (
+                deterministic_brief.clone(),
+                DistillMode::Deterministic,
+                Some(format!(
+                    "codex distillation failed, fell back to deterministic: {error}"
+                )),
+            ),
+        },
     };
     let report = build_report(
         &summary,
@@ -80,21 +98,19 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         brief.as_str(),
         successor_thread_name.clone(),
         &target_runtime_config,
-        args.distill_mode,
+        effective_distill_mode,
+        distill_note,
     );
 
     if args.preview_only {
-        return print_output(
-            DistillOutput {
-                successor_thread_id: None,
-                successor_rollout_path: None,
-                resume_command: None,
-                source_archived: summary.archived,
-                report,
-                brief,
-            },
-            args.json,
-        );
+        return Ok(DistillOutput {
+            successor_thread_id: None,
+            successor_rollout_path: None,
+            resume_command: None,
+            source_archived: summary.archived,
+            report,
+            brief,
+        });
     }
 
     let runtime_config = target_runtime_config;
@@ -170,7 +186,7 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         .await?;
     }
 
-    let output = DistillOutput {
+    Ok(DistillOutput {
         successor_thread_id: Some(new_thread.thread_id.to_string()),
         successor_rollout_path: Some(successor_rollout_path),
         resume_command: Some(render_profiled_resume_command(
@@ -180,8 +196,7 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
         source_archived: args.archive_source,
         report,
         brief,
-    };
-    print_output(output, args.json)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -189,42 +204,44 @@ struct DistillAnalysis {
     latest_compaction_summary: Option<String>,
     recent_user_messages: Vec<String>,
     recent_assistant_messages: Vec<String>,
+    durable_guidance: Vec<String>,
     recent_warnings: Vec<String>,
     recent_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct DistillReport {
-    source_thread_id: String,
-    source_thread_name: Option<String>,
-    source_rollout_path: std::path::PathBuf,
-    source_provider: Option<String>,
-    source_model: Option<String>,
-    source_context_tokens_estimate: Option<i64>,
-    source_context_window: Option<i64>,
-    source_user_turns: usize,
-    successor_provider: String,
-    successor_model: String,
-    successor_context_window: Option<i64>,
-    distill_mode: String,
-    successor_thread_name: String,
-    successor_seed_tokens_estimate: usize,
-    compression_ratio: Option<f64>,
-    recent_user_messages_kept: usize,
-    recent_assistant_messages_kept: usize,
-    warnings_kept: usize,
-    errors_kept: usize,
-    had_compaction_summary: bool,
+pub(crate) struct DistillReport {
+    pub(crate) source_thread_id: String,
+    pub(crate) source_thread_name: Option<String>,
+    pub(crate) source_rollout_path: std::path::PathBuf,
+    pub(crate) source_provider: Option<String>,
+    pub(crate) source_model: Option<String>,
+    pub(crate) source_context_tokens_estimate: Option<i64>,
+    pub(crate) source_context_window: Option<i64>,
+    pub(crate) source_user_turns: usize,
+    pub(crate) successor_provider: String,
+    pub(crate) successor_model: String,
+    pub(crate) successor_context_window: Option<i64>,
+    pub(crate) distill_mode: String,
+    pub(crate) distill_note: Option<String>,
+    pub(crate) successor_thread_name: String,
+    pub(crate) successor_seed_tokens_estimate: usize,
+    pub(crate) compression_ratio: Option<f64>,
+    pub(crate) recent_user_messages_kept: usize,
+    pub(crate) recent_assistant_messages_kept: usize,
+    pub(crate) warnings_kept: usize,
+    pub(crate) errors_kept: usize,
+    pub(crate) had_compaction_summary: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct DistillOutput {
-    successor_thread_id: Option<String>,
-    successor_rollout_path: Option<std::path::PathBuf>,
-    resume_command: Option<String>,
-    source_archived: bool,
-    report: DistillReport,
-    brief: String,
+pub(crate) struct DistillOutput {
+    pub(crate) successor_thread_id: Option<String>,
+    pub(crate) successor_rollout_path: Option<std::path::PathBuf>,
+    pub(crate) resume_command: Option<String>,
+    pub(crate) source_archived: bool,
+    pub(crate) report: DistillReport,
+    pub(crate) brief: String,
 }
 
 fn analyze_rollout(
@@ -367,6 +384,7 @@ fn analyze_rollout(
         latest_compaction_summary,
         recent_user_messages: take_tail_dedup(user_messages, recent_turns),
         recent_assistant_messages: take_tail_dedup(assistant_messages, recent_turns),
+        durable_guidance: collect_durable_guidance(reconstructed_items, recent_turns.max(12)),
         recent_warnings: take_tail_dedup(warnings, 6),
         recent_errors: take_tail_dedup(errors, 6),
     }
@@ -434,6 +452,20 @@ fn build_distilled_brief(
         ));
     }
 
+    if !analysis.durable_guidance.is_empty() {
+        sections.push(String::new());
+        sections.push("# Durable Conventions And Corrections".to_string());
+        sections.extend(
+            analysis
+                .durable_guidance
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    format!("{}. {}", index + 1, truncate_for_brief(message, 360))
+                }),
+        );
+    }
+
     if !analysis.recent_warnings.is_empty() || !analysis.recent_errors.is_empty() {
         sections.push(String::new());
         sections.push("# Recent Warnings And Errors".to_string());
@@ -473,6 +505,7 @@ fn build_report(
     successor_thread_name: String,
     target_runtime_config: &codex_core::config::Config,
     distill_mode: DistillMode,
+    distill_note: Option<String>,
 ) -> DistillReport {
     let successor_seed_tokens_estimate = approx_token_count(brief);
     let compression_ratio = summary.latest_context_tokens.and_then(|source_tokens| {
@@ -495,6 +528,7 @@ fn build_report(
             DistillMode::Codex => "codex".to_string(),
             DistillMode::Deterministic => "deterministic".to_string(),
         },
+        distill_note,
         successor_thread_name,
         successor_seed_tokens_estimate,
         compression_ratio,
@@ -594,95 +628,107 @@ fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>
     Ok(Some(parsed))
 }
 
-fn print_output(output: DistillOutput, json: bool) -> Result<()> {
+pub(crate) fn render_output_lines(output: &DistillOutput) -> Vec<String> {
+    let mut lines = vec![
+        format!("source_thread_id: {}", output.report.source_thread_id),
+        format!(
+            "source_thread_name: {}",
+            output.report.source_thread_name.as_deref().unwrap_or("")
+        ),
+        format!(
+            "source_rollout_path: {}",
+            output.report.source_rollout_path.display()
+        ),
+        format!(
+            "source_provider: {}",
+            output.report.source_provider.as_deref().unwrap_or("")
+        ),
+        format!(
+            "source_model: {}",
+            output.report.source_model.as_deref().unwrap_or("")
+        ),
+        format!(
+            "source_context_tokens_estimate: {}",
+            output
+                .report
+                .source_context_tokens_estimate
+                .map_or_else(String::new, |value| value.to_string())
+        ),
+        format!("successor_provider: {}", output.report.successor_provider),
+        format!("successor_model: {}", output.report.successor_model),
+        format!(
+            "successor_context_window: {}",
+            output
+                .report
+                .successor_context_window
+                .map_or_else(String::new, |value| value.to_string())
+        ),
+        format!("distill_mode: {}", output.report.distill_mode),
+        format!(
+            "distill_note: {}",
+            output.report.distill_note.as_deref().unwrap_or("")
+        ),
+        format!(
+            "successor_seed_tokens_estimate: {}",
+            output.report.successor_seed_tokens_estimate
+        ),
+        format!(
+            "compression_ratio: {}",
+            output
+                .report
+                .compression_ratio
+                .map_or_else(String::new, |value| format!("{value:.4}"))
+        ),
+        format!(
+            "successor_thread_name: {}",
+            output.report.successor_thread_name
+        ),
+        format!(
+            "had_compaction_summary: {}",
+            output.report.had_compaction_summary
+        ),
+        format!(
+            "recent_user_messages_kept: {}",
+            output.report.recent_user_messages_kept
+        ),
+        format!(
+            "recent_assistant_messages_kept: {}",
+            output.report.recent_assistant_messages_kept
+        ),
+        format!("warnings_kept: {}", output.report.warnings_kept),
+        format!("errors_kept: {}", output.report.errors_kept),
+        format!(
+            "successor_thread_id: {}",
+            output.successor_thread_id.as_deref().unwrap_or("")
+        ),
+        format!(
+            "successor_rollout_path: {}",
+            output
+                .successor_rollout_path
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string())
+        ),
+        format!(
+            "resume_command: {}",
+            output.resume_command.as_deref().unwrap_or("")
+        ),
+        format!("source_archived: {}", output.source_archived),
+    ];
+    if !output.brief.is_empty() {
+        lines.push(String::new());
+        lines.push("brief:".to_string());
+        lines.extend(output.brief.lines().map(ToOwned::to_owned));
+    }
+    lines
+}
+
+fn print_output(output: &DistillOutput, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
-
-    println!("source_thread_id: {}", output.report.source_thread_id);
-    println!(
-        "source_thread_name: {}",
-        output.report.source_thread_name.as_deref().unwrap_or("")
-    );
-    println!(
-        "source_rollout_path: {}",
-        output.report.source_rollout_path.display()
-    );
-    println!(
-        "source_provider: {}",
-        output.report.source_provider.as_deref().unwrap_or("")
-    );
-    println!(
-        "source_model: {}",
-        output.report.source_model.as_deref().unwrap_or("")
-    );
-    println!(
-        "source_context_tokens_estimate: {}",
-        output
-            .report
-            .source_context_tokens_estimate
-            .map_or_else(String::new, |value| value.to_string())
-    );
-    println!("successor_provider: {}", output.report.successor_provider);
-    println!("successor_model: {}", output.report.successor_model);
-    println!(
-        "successor_context_window: {}",
-        output
-            .report
-            .successor_context_window
-            .map_or_else(String::new, |value| value.to_string())
-    );
-    println!("distill_mode: {}", output.report.distill_mode);
-    println!(
-        "successor_seed_tokens_estimate: {}",
-        output.report.successor_seed_tokens_estimate
-    );
-    println!(
-        "compression_ratio: {}",
-        output
-            .report
-            .compression_ratio
-            .map_or_else(String::new, |value| format!("{value:.4}"))
-    );
-    println!(
-        "successor_thread_name: {}",
-        output.report.successor_thread_name
-    );
-    println!(
-        "had_compaction_summary: {}",
-        output.report.had_compaction_summary
-    );
-    println!(
-        "recent_user_messages_kept: {}",
-        output.report.recent_user_messages_kept
-    );
-    println!(
-        "recent_assistant_messages_kept: {}",
-        output.report.recent_assistant_messages_kept
-    );
-    println!("warnings_kept: {}", output.report.warnings_kept);
-    println!("errors_kept: {}", output.report.errors_kept);
-    println!(
-        "successor_thread_id: {}",
-        output.successor_thread_id.as_deref().unwrap_or("")
-    );
-    println!(
-        "successor_rollout_path: {}",
-        output
-            .successor_rollout_path
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string())
-    );
-    println!(
-        "resume_command: {}",
-        output.resume_command.as_deref().unwrap_or("")
-    );
-    println!("source_archived: {}", output.source_archived);
-    println!();
-    if !output.brief.is_empty() {
-        println!("brief:");
-        println!("{}", output.brief);
+    for line in render_output_lines(output) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -775,6 +821,61 @@ fn agent_message_text(item: &codex_protocol::items::AgentMessageItem) -> String 
 
 fn normalize_message(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn collect_durable_guidance(items: &[RolloutItem], limit: usize) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for item in items {
+        let RolloutItem::ResponseItem(response_item) = item else {
+            continue;
+        };
+        let text = match parse_turn_item(response_item) {
+            Some(TurnItem::UserMessage(user_message)) => {
+                normalize_message(user_message.message().as_str())
+            }
+            Some(TurnItem::AgentMessage(agent_message)) => agent_message_text(&agent_message),
+            Some(TurnItem::Plan(_))
+            | Some(TurnItem::Reasoning(_))
+            | Some(TurnItem::WebSearch(_))
+            | Some(TurnItem::ImageGeneration(_))
+            | Some(TurnItem::ContextCompaction(_))
+            | None => continue,
+        };
+        if is_durable_guidance(text.as_str()) {
+            candidates.push(text);
+        }
+    }
+    take_tail_dedup(candidates, limit)
+}
+
+fn is_durable_guidance(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    [
+        "must",
+        "should",
+        "prefer",
+        "always",
+        "never",
+        "style",
+        "convention",
+        "guideline",
+        "source of truth",
+        "remember this",
+        "do not",
+        "don't",
+        "不要",
+        "必须",
+        "应该",
+        "优先",
+        "一律",
+        "规范",
+        "风格",
+        "记住这个",
+        "注意",
+        "source-backed",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn truncate_for_brief(message: &str, max_chars: usize) -> String {
@@ -908,6 +1009,7 @@ mod tests {
             latest_compaction_summary: Some("older summary".to_string()),
             recent_user_messages: vec!["do task".to_string()],
             recent_assistant_messages: vec!["task done".to_string()],
+            durable_guidance: vec!["always prefer source-backed fixes".to_string()],
             recent_warnings: vec![],
             recent_errors: vec!["failure".to_string()],
         };
@@ -926,6 +1028,7 @@ mod tests {
             latest_compaction_summary: None,
             recent_user_messages: vec!["one".to_string()],
             recent_assistant_messages: vec!["two".to_string()],
+            durable_guidance: vec![],
             recent_warnings: vec![],
             recent_errors: vec![],
         };
@@ -940,6 +1043,7 @@ mod tests {
             "Distilled".to_string(),
             &runtime,
             DistillMode::Deterministic,
+            None,
         );
         assert_eq!(
             report.successor_seed_tokens_estimate,

@@ -4,6 +4,7 @@ use crate::cli::DistillArgs;
 use crate::cli::MigrateArgs;
 use crate::cli::RepairResumeStateArgs;
 use crate::cli::SmartArgs;
+use crate::distill;
 use crate::run_command;
 use crate::runtime::load_runtime_config;
 use crate::runtime::render_profiled_resume_command;
@@ -15,7 +16,10 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use codex_core::AuthManager;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
+use codex_core::ThreadSortKey;
 use codex_core::config::CONFIG_TOML_FILE;
 use codex_core::config::Config;
 use codex_core::config::ConfigToml;
@@ -60,6 +64,25 @@ use std::time::Duration;
 const PICKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) async fn run(args: SmartArgs) -> Result<()> {
+    let Some(result) = execute(args).await? else {
+        return Ok(());
+    };
+    for line in &result.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+pub(crate) async fn execute(args: SmartArgs) -> Result<Option<SmartExecutionOutput>> {
+    let prepared = prepare_execution(args).await?;
+    let Some(selection) = pick_selection(&prepared).await? else {
+        return Ok(None);
+    };
+
+    execute_prepared(prepared, selection).await.map(Some)
+}
+
+pub(crate) async fn prepare_execution(args: SmartArgs) -> Result<PreparedSmartExecution> {
     if args.max_pre_compactions == 0 {
         bail!("max_pre_compactions must be >= 1");
     }
@@ -76,21 +99,40 @@ pub(crate) async fn run(args: SmartArgs) -> Result<()> {
         .or(resolved.config.model.clone())
         .unwrap_or_default();
     let global_config = load_global_config_toml(resolved.config.codex_home.as_path())?;
-    let provider_choices = collect_provider_choices(&global_config, current_provider.as_str());
-
-    let selection = SmartPicker::run(SmartContext {
-        args: &args,
-        summary: &summary,
-        current_provider,
-        current_model,
-        provider_choices,
+    Ok(PreparedSmartExecution {
+        args,
+        source_config: resolved.config,
+        summary,
+        current_provider: current_provider.clone(),
+        current_model: current_model.clone(),
+        provider_choices: collect_provider_choices(&global_config, current_provider.as_str()),
     })
-    .await?;
-    let Some(selection) = selection else {
-        return Ok(());
-    };
+}
 
-    execute_selection(args, resolved.config, summary, selection).await
+pub(crate) async fn pick_selection(
+    prepared: &PreparedSmartExecution,
+) -> Result<Option<SmartSelection>> {
+    SmartPicker::run(SmartContext {
+        args: &prepared.args,
+        summary: &prepared.summary,
+        current_provider: prepared.current_provider.clone(),
+        current_model: prepared.current_model.clone(),
+        provider_choices: prepared.provider_choices.clone(),
+    })
+    .await
+}
+
+pub(crate) async fn execute_prepared(
+    prepared: PreparedSmartExecution,
+    selection: SmartSelection,
+) -> Result<SmartExecutionOutput> {
+    execute_selection(
+        prepared.args,
+        prepared.source_config,
+        prepared.summary,
+        selection,
+    )
+    .await
 }
 
 async fn execute_selection(
@@ -98,7 +140,8 @@ async fn execute_selection(
     source_config: Config,
     mut summary: crate::types::SessionSummary,
     selection: SmartSelection,
-) -> Result<()> {
+) -> Result<SmartExecutionOutput> {
+    let target_args = args.target.clone();
     let current_provider = summary
         .session_provider
         .clone()
@@ -120,7 +163,7 @@ async fn execute_selection(
         selection.execution_mode,
         SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic
     ) {
-        return run_command(Command::Distill(DistillArgs {
+        let output = distill::execute(DistillArgs {
             target: args.target,
             provider: Some(selection.provider),
             model: Some(selection.model),
@@ -133,14 +176,20 @@ async fn execute_selection(
             },
             reasoning_effort: None,
             thread_name: summary.thread_name.clone(),
-            write_profile: Some(target_profile),
+            write_profile: Some(target_profile.clone()),
             archive_source: args.archive_source,
             preview_only: false,
             json: false,
             recent_turns: 8,
             timeout_secs: args.timeout_secs,
-        }))
-        .await;
+        })
+        .await?;
+        return Ok(SmartExecutionOutput {
+            title: "Distilled Successor Ready".to_string(),
+            lines: distill::render_output_lines(&output),
+            preferred_thread_id: output.successor_thread_id.clone(),
+            preferred_rollout_path: output.successor_rollout_path.clone(),
+        });
     }
 
     if selection.provider == current_provider {
@@ -189,30 +238,54 @@ async fn execute_selection(
             .await?
             .meta
             .id;
-        println!("smart_strategy: same-thread");
-        println!("target_provider: {}", selection.provider);
-        println!("target_model: {}", selection.model);
-        println!(
-            "target_context_window: {}",
-            selection
-                .target_context_window
-                .map_or_else(String::new, |value| value.to_string())
-        );
-        println!("profile: {}", target_profile);
-        println!(
-            "resume_command: {}",
-            render_profiled_resume_command(Some(target_profile.as_str()), thread_id)
-        );
-        return Ok(());
+        return Ok(SmartExecutionOutput {
+            title: "Smart Switch Completed".to_string(),
+            lines: vec![
+                "smart_strategy: same-thread".to_string(),
+                format!("target_provider: {}", selection.provider),
+                format!("target_model: {}", selection.model),
+                format!(
+                    "target_context_window: {}",
+                    selection
+                        .target_context_window
+                        .map_or_else(String::new, |value| value.to_string())
+                ),
+                format!("profile: {}", target_profile),
+                format!(
+                    "resume_command: {}",
+                    render_profiled_resume_command(Some(target_profile.as_str()), thread_id)
+                ),
+            ],
+            preferred_thread_id: Some(thread_id.to_string()),
+            preferred_rollout_path: Some(summary.rollout_path.clone()),
+        });
     }
-
+    let before_thread_ids = {
+        let config = source_config.clone();
+        let items = RolloutRecorder::list_threads(
+            &config,
+            500,
+            None,
+            ThreadSortKey::UpdatedAt,
+            INTERACTIVE_SESSION_SOURCES,
+            None,
+            config.model_provider_id.as_str(),
+            None,
+        )
+        .await?;
+        items
+            .items
+            .into_iter()
+            .filter_map(|item| item.thread_id.map(|id| id.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+    };
     run_command(Command::Migrate(MigrateArgs {
-        target: args.target,
+        target: target_args.clone(),
         model: Some(selection.model.clone()),
         provider: Some(selection.provider.clone()),
         context_window: selection.target_context_window,
         auto_compact_token_limit: selection.target_auto_compact_token_limit,
-        write_profile: Some(target_profile),
+        write_profile: Some(target_profile.clone()),
         thread_name: summary.thread_name.clone(),
         persist_extended_history: false,
         nth_user_message: None,
@@ -221,7 +294,63 @@ async fn execute_selection(
         archive_source: args.archive_source,
         timeout_secs: args.timeout_secs,
     }))
-    .await
+    .await?;
+    let config =
+        load_runtime_config(target_args.config_profile, None, None, None, None, None).await?;
+    let items = RolloutRecorder::list_threads(
+        &config,
+        500,
+        None,
+        ThreadSortKey::UpdatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        None,
+        config.model_provider_id.as_str(),
+        None,
+    )
+    .await?;
+    let successor = items.items.into_iter().find(|item| {
+        item.thread_id
+            .as_ref()
+            .is_some_and(|id| !before_thread_ids.contains(&id.to_string()))
+    });
+    let preferred_thread_id = successor
+        .as_ref()
+        .and_then(|item| item.thread_id.as_ref().map(ToString::to_string));
+    let preferred_rollout_path = successor.map(|item| item.path);
+    Ok(SmartExecutionOutput {
+        title: "Smart Switch Completed".to_string(),
+        lines: vec![
+            "smart_strategy: cross-provider-migrate".to_string(),
+            format!("target_provider: {}", selection.provider),
+            format!("target_model: {}", selection.model),
+            format!(
+                "target_context_window: {}",
+                selection
+                    .target_context_window
+                    .map_or_else(String::new, |value| value.to_string())
+            ),
+            format!("profile: {}", target_profile),
+            format!("archive_source: {}", args.archive_source),
+        ],
+        preferred_thread_id,
+        preferred_rollout_path,
+    })
+}
+
+pub(crate) struct SmartExecutionOutput {
+    pub(crate) title: String,
+    pub(crate) lines: Vec<String>,
+    pub(crate) preferred_thread_id: Option<String>,
+    pub(crate) preferred_rollout_path: Option<std::path::PathBuf>,
+}
+
+pub(crate) struct PreparedSmartExecution {
+    args: SmartArgs,
+    source_config: Config,
+    summary: crate::types::SessionSummary,
+    current_provider: String,
+    current_model: String,
+    provider_choices: Vec<String>,
 }
 
 struct SmartContext<'a> {
@@ -233,7 +362,7 @@ struct SmartContext<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct SmartSelection {
+pub(crate) struct SmartSelection {
     provider: String,
     model: String,
     execution_mode: SmartExecutionMode,
