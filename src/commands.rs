@@ -16,6 +16,7 @@ use crate::operations::reconcile_rollout_path;
 use crate::operations::repair_rollout_state;
 use crate::operations::rollback_rollout_once;
 use crate::operations::unarchive_rollout_file;
+use crate::preview;
 use crate::rollout_edit::MetaPatch;
 use crate::rollout_edit::ResumeStatePatch;
 use crate::rollout_edit::rewrite_rollout_meta_contents;
@@ -57,6 +58,7 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         Command::Rollback(args) => rollback_session(args).await,
         Command::Migrate(args) => migrate_session(args).await,
         Command::Smart(args) => smart::run(args).await,
+        Command::FirstTokenPreview(args) => preview::run(args).await,
         Command::Distill(args) => distill::run(args).await,
     }
 }

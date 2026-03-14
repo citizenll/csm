@@ -61,6 +61,9 @@ pub(crate) enum Command {
     Migrate(MigrateArgs),
     /// Interactive smart provider/model switch workflow.
     Smart(SmartArgs),
+    /// Preview the next model-visible prompt built when this thread resumes.
+    #[command(name = "first-token-preview", alias = "preview")]
+    FirstTokenPreview(FirstTokenPreviewArgs),
     /// Distill a heavy session into a lighter successor session.
     Distill(DistillArgs),
 }
@@ -330,4 +333,18 @@ pub(crate) struct DistillArgs {
     /// Maximum seconds to wait for the seed handoff turn to complete.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub(crate) timeout_secs: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct FirstTokenPreviewArgs {
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+
+    /// Optional next user input to include at the end of the simulated prompt.
+    #[arg(long)]
+    pub(crate) input: Option<String>,
+
+    /// Emit structured JSON instead of plain text output.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
 }

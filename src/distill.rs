@@ -5,6 +5,11 @@ use crate::operations::build_thread_manager;
 use crate::operations::reconcile_rollout_path;
 use crate::operations::resolve_new_rollout_path;
 use crate::operations::shutdown_thread;
+use crate::preview;
+use crate::progress::DistillProgressEvent;
+use crate::progress::OperationProgressEvent;
+use crate::progress::ProgressSender;
+use crate::progress::emit_progress;
 use crate::runtime::load_runtime_config;
 use crate::runtime::render_profiled_resume_command;
 use crate::runtime::resolve_target;
@@ -37,12 +42,31 @@ pub(crate) async fn run(args: DistillArgs) -> Result<()> {
 }
 
 pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
+    execute_with_progress(args, None).await
+}
+
+pub(crate) async fn execute_with_progress(
+    args: DistillArgs,
+    progress: Option<ProgressSender>,
+) -> Result<DistillOutput> {
     if args.recent_turns == 0 {
         bail!("recent_turns must be >= 1");
     }
 
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::ResolvingTarget),
+    );
     let resolved = resolve_target(&args.target).await?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::LoadingSessionSummary),
+    );
     let summary = build_session_summary(&resolved.config, resolved.rollout_path.as_path()).await?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::RebuildingHistory),
+    );
     let initial_history =
         codex_core::RolloutRecorder::get_rollout_history(resolved.rollout_path.as_path())
             .await
@@ -53,15 +77,45 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
                 )
             })?;
     let reconstructed_items = initial_history.get_rollout_items();
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::ReadingRolloutLines),
+    );
     let raw_rollout_lines = read_rollout_lines(resolved.rollout_path.as_path()).await?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::AnalyzingHistory {
+            history_items: reconstructed_items.len(),
+            raw_lines: raw_rollout_lines.len(),
+        }),
+    );
+    let prompt_preview = preview::build_prompt_preview_for_distill(&args.target).await?;
     let analysis = analyze_rollout(
-        reconstructed_items.as_slice(),
+        prompt_preview.reconstructed_history.as_slice(),
         raw_rollout_lines.as_slice(),
+        &prompt_preview,
         args.recent_turns,
     );
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::BuildingDeterministicBrief),
+    );
     let deterministic_brief = build_distilled_brief(&summary, &analysis);
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::DeterministicBriefReady {
+            user_messages: analysis.recent_user_messages.len(),
+            assistant_messages: analysis.recent_assistant_messages.len(),
+            durable_guidance: analysis.durable_guidance.len(),
+            estimated_tokens: approx_token_count(deterministic_brief.as_str()),
+        }),
+    );
     let successor_thread_name =
         default_distilled_thread_name(&summary, args.thread_name.as_deref())?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::ResolvingRuntimeConfig),
+    );
     let target_runtime_config = load_distill_runtime_config(&args, &summary).await?;
     let session_source = read_session_meta_line(summary.rollout_path.as_path())
         .await?
@@ -79,19 +133,35 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
             deterministic_brief.as_str(),
             parse_reasoning_effort(args.reasoning_effort.as_deref())?,
             args.timeout_secs,
+            progress.as_ref(),
         )
         .await
         {
             Ok(brief) => (brief, DistillMode::Codex, None),
-            Err(error) => (
-                deterministic_brief.clone(),
-                DistillMode::Deterministic,
-                Some(format!(
-                    "codex distillation failed, fell back to deterministic: {error}"
-                )),
-            ),
+            Err(error) => {
+                emit_progress(
+                    progress.as_ref(),
+                    OperationProgressEvent::Distill(
+                        DistillProgressEvent::CodexDistillationFallback {
+                            error: error.to_string(),
+                            estimated_tokens: approx_token_count(deterministic_brief.as_str()),
+                        },
+                    ),
+                );
+                (
+                    deterministic_brief.clone(),
+                    DistillMode::Deterministic,
+                    Some(format!(
+                        "codex distillation failed, fell back to deterministic: {error}"
+                    )),
+                )
+            }
         },
     };
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::BuildingReport),
+    );
     let report = build_report(
         &summary,
         &analysis,
@@ -103,24 +173,46 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
     );
 
     if args.preview_only {
-        return Ok(DistillOutput {
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Distill(DistillProgressEvent::PreviewReady),
+        );
+        let output = DistillOutput {
             successor_thread_id: None,
             successor_rollout_path: None,
             resume_command: None,
             source_archived: summary.archived,
             report,
             brief,
-        });
+        };
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Distill(DistillProgressEvent::Completed {
+                preview_only: true,
+                successor_thread_id: None,
+            }),
+        );
+        return Ok(output);
     }
 
     let runtime_config = target_runtime_config;
     if let Some(profile) = args.write_profile.as_deref() {
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Distill(DistillProgressEvent::WritingProfile {
+                profile: profile.to_string(),
+            }),
+        );
         write_profile_from_config(profile, &runtime_config).await?;
     }
 
     let session_meta = read_session_meta_line(summary.rollout_path.as_path()).await?;
     let (thread_manager, _auth_manager) =
         build_thread_manager(&runtime_config, session_meta.meta.source.clone());
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::StartingSuccessorThread),
+    );
     let new_thread = thread_manager
         .start_thread(runtime_config.clone())
         .await
@@ -135,12 +227,22 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
     )
     .await
     .with_context(|| format!("failed to assign thread name `{successor_name}`"))?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::SuccessorThreadNamed {
+            thread_name: successor_name.clone(),
+        }),
+    );
 
     let model = runtime_config
         .model
         .clone()
         .or(summary.latest_model.clone())
         .context("could not resolve model slug for distilled successor")?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::SeedingSuccessorThread),
+    );
     let submit_id = new_thread
         .thread
         .submit(Op::UserTurn {
@@ -169,8 +271,16 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
         shutdown_thread(&thread_manager, new_thread.thread_id, &new_thread.thread).await;
     seed_turn_result?;
     shutdown_result?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::SeedTurnCompleted),
+    );
 
     if args.archive_source {
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Distill(DistillProgressEvent::ArchivingSource),
+        );
         let archived_path = archive_rollout_file(
             runtime_config.codex_home.as_path(),
             session_meta.meta.id,
@@ -186,7 +296,7 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
         .await?;
     }
 
-    Ok(DistillOutput {
+    let output = DistillOutput {
         successor_thread_id: Some(new_thread.thread_id.to_string()),
         successor_rollout_path: Some(successor_rollout_path),
         resume_command: Some(render_profiled_resume_command(
@@ -196,7 +306,15 @@ pub(crate) async fn execute(args: DistillArgs) -> Result<DistillOutput> {
         source_archived: args.archive_source,
         report,
         brief,
-    })
+    };
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Distill(DistillProgressEvent::Completed {
+            preview_only: false,
+            successor_thread_id: output.successor_thread_id.clone(),
+        }),
+    );
+    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +323,7 @@ struct DistillAnalysis {
     recent_user_messages: Vec<String>,
     recent_assistant_messages: Vec<String>,
     durable_guidance: Vec<String>,
+    prompt_reconstruction_notes: Vec<String>,
     recent_warnings: Vec<String>,
     recent_errors: Vec<String>,
 }
@@ -245,17 +364,15 @@ pub(crate) struct DistillOutput {
 }
 
 fn analyze_rollout(
-    reconstructed_items: &[RolloutItem],
+    reconstructed_items: &[codex_protocol::models::ResponseItem],
     raw_rollout_lines: &[RolloutLine],
+    prompt_preview: &preview::PromptPreviewSnapshot,
     recent_turns: usize,
 ) -> DistillAnalysis {
     let mut user_messages = Vec::new();
     let mut assistant_messages = Vec::new();
     for item in reconstructed_items {
-        let RolloutItem::ResponseItem(response_item) = item else {
-            continue;
-        };
-        match parse_turn_item(response_item) {
+        match parse_turn_item(item) {
             Some(TurnItem::UserMessage(user_message)) => {
                 let text = normalize_message(user_message.message().as_str());
                 if !text.is_empty() {
@@ -381,10 +498,17 @@ fn analyze_rollout(
     }
 
     DistillAnalysis {
-        latest_compaction_summary,
+        latest_compaction_summary: prompt_preview
+            .latest_compaction_summary
+            .clone()
+            .or(latest_compaction_summary),
         recent_user_messages: take_tail_dedup(user_messages, recent_turns),
         recent_assistant_messages: take_tail_dedup(assistant_messages, recent_turns),
-        durable_guidance: collect_durable_guidance(reconstructed_items, recent_turns.max(12)),
+        durable_guidance: collect_durable_guidance_from_response_items(
+            reconstructed_items,
+            recent_turns.max(12),
+        ),
+        prompt_reconstruction_notes: prompt_reconstruction_notes(prompt_preview),
         recent_warnings: take_tail_dedup(warnings, 6),
         recent_errors: take_tail_dedup(errors, 6),
     }
@@ -434,6 +558,12 @@ fn build_distilled_brief(
         sections.push(String::new());
         sections.push("# Existing Compaction Summary".to_string());
         sections.push(truncate_for_brief(compaction_summary, 1800));
+    }
+
+    if !analysis.prompt_reconstruction_notes.is_empty() {
+        sections.push(String::new());
+        sections.push("# Next-Turn Prompt Reconstruction".to_string());
+        sections.extend(analysis.prompt_reconstruction_notes.iter().cloned());
     }
 
     if !analysis.recent_user_messages.is_empty() {
@@ -561,14 +691,23 @@ async fn run_codex_distillation(
     deterministic_brief: &str,
     reasoning_effort: Option<ReasoningEffort>,
     timeout_secs: u64,
+    progress: Option<&ProgressSender>,
 ) -> Result<String> {
     let mut ephemeral_config = runtime_config.clone();
     ephemeral_config.ephemeral = true;
+    emit_progress(
+        progress,
+        OperationProgressEvent::Distill(DistillProgressEvent::StartingCodexDistillation),
+    );
     let (thread_manager, _auth_manager) = build_thread_manager(&ephemeral_config, session_source);
     let new_thread = thread_manager
         .start_thread(ephemeral_config.clone())
         .await
         .context("failed to start ephemeral codex distillation thread")?;
+    emit_progress(
+        progress,
+        OperationProgressEvent::Distill(DistillProgressEvent::CodexEphemeralThreadStarted),
+    );
     let model = ephemeral_config
         .model
         .clone()
@@ -593,6 +732,10 @@ async fn run_codex_distillation(
         })
         .await
         .context("failed to submit codex distillation turn")?;
+    emit_progress(
+        progress,
+        OperationProgressEvent::Distill(DistillProgressEvent::CodexTurnSubmitted),
+    );
 
     let result =
         wait_for_turn_completion_last_message(&new_thread.thread, submit_id.as_str(), timeout_secs)
@@ -601,7 +744,14 @@ async fn run_codex_distillation(
         shutdown_thread(&thread_manager, new_thread.thread_id, &new_thread.thread).await;
     let last_message = result?;
     shutdown_result?;
-    last_message.context("codex distillation returned no assistant message")
+    let brief = last_message.context("codex distillation returned no assistant message")?;
+    emit_progress(
+        progress,
+        OperationProgressEvent::Distill(DistillProgressEvent::CodexDistillationCompleted {
+            estimated_tokens: approx_token_count(brief.as_str()),
+        }),
+    );
+    Ok(brief)
 }
 
 fn codex_distillation_prompt(deterministic_brief: &str) -> String {
@@ -823,13 +973,13 @@ fn normalize_message(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn collect_durable_guidance(items: &[RolloutItem], limit: usize) -> Vec<String> {
+fn collect_durable_guidance_from_response_items(
+    items: &[codex_protocol::models::ResponseItem],
+    limit: usize,
+) -> Vec<String> {
     let mut candidates = Vec::new();
     for item in items {
-        let RolloutItem::ResponseItem(response_item) = item else {
-            continue;
-        };
-        let text = match parse_turn_item(response_item) {
+        let text = match parse_turn_item(item) {
             Some(TurnItem::UserMessage(user_message)) => {
                 normalize_message(user_message.message().as_str())
             }
@@ -846,6 +996,69 @@ fn collect_durable_guidance(items: &[RolloutItem], limit: usize) -> Vec<String> 
         }
     }
     take_tail_dedup(candidates, limit)
+}
+
+fn prompt_reconstruction_notes(prompt_preview: &preview::PromptPreviewSnapshot) -> Vec<String> {
+    let mut notes = vec![
+        format!(
+            "- Reconstructed model-visible history items: {}",
+            prompt_preview.history_items_count
+        ),
+        format!(
+            "- Reconstructed history tokens estimate: {}",
+            prompt_preview.history_tokens_estimate
+        ),
+    ];
+    if let Some(previous_turn_model) = prompt_preview.previous_turn_model.as_deref() {
+        notes.push(format!(
+            "- Previous surviving turn model: {previous_turn_model}"
+        ));
+    }
+    match &prompt_preview.context_strategy {
+        preview::NextTurnContextStrategy::FullInitialContext {
+            model_switch_message,
+            memory_prompt,
+            developer_instructions,
+            user_instructions,
+        } => {
+            notes.push(
+                "- Next real user turn will reinject full canonical initial context.".to_string(),
+            );
+            notes.push(format!(
+                "- Model-switch developer message will be injected: {model_switch_message}"
+            ));
+            notes.push(format!("- Memory prompt available: {memory_prompt}"));
+            notes.push(format!(
+                "- Runtime developer instructions present: {developer_instructions}"
+            ));
+            notes.push(format!(
+                "- Runtime user instructions present: {user_instructions}"
+            ));
+        }
+        preview::NextTurnContextStrategy::SettingsUpdate {
+            model_switch_message,
+            reasons,
+        } => {
+            notes.push(
+                "- Next real user turn will reuse the current baseline and append only context diffs."
+                    .to_string(),
+            );
+            notes.push(format!(
+                "- Model-switch developer message will be injected: {model_switch_message}"
+            ));
+            if !reasons.is_empty() {
+                notes.push(format!(
+                    "- Expected settings update reasons: {}",
+                    reasons.join(", ")
+                ));
+            }
+        }
+    }
+    notes.push(format!(
+        "- Memory prompt available: {}",
+        prompt_preview.memory_prompt_available
+    ));
+    notes
 }
 
 fn is_durable_guidance(text: &str) -> bool {
@@ -900,6 +1113,8 @@ mod tests {
     use super::build_report;
     use super::parse_reasoning_effort;
     use crate::cli::DistillMode;
+    use crate::preview::NextTurnContextStrategy;
+    use crate::preview::PromptPreviewSnapshot;
     use crate::types::SessionSummary;
     use codex_core::config::ConfigBuilder;
     use codex_protocol::models::ContentItem;
@@ -964,10 +1179,10 @@ mod tests {
     #[test]
     fn analyze_rollout_collects_recent_signals() {
         let reconstructed_items = vec![
-            RolloutItem::ResponseItem(response_message("user", "first request")),
-            RolloutItem::ResponseItem(response_message("assistant", "first result")),
-            RolloutItem::ResponseItem(response_message("user", "second request")),
-            RolloutItem::ResponseItem(response_message("assistant", "second result")),
+            response_message("user", "first request"),
+            response_message("assistant", "first result"),
+            response_message("user", "second request"),
+            response_message("assistant", "second result"),
         ];
         let raw_rollout_lines = vec![
             RolloutLine {
@@ -986,8 +1201,30 @@ mod tests {
                 )),
             },
         ];
+        let prompt_preview = PromptPreviewSnapshot {
+            reconstructed_history: reconstructed_items.clone(),
+            history_items_count: reconstructed_items.len(),
+            history_tokens_estimate: 100,
+            previous_turn_model: Some("gpt-5.4".to_string()),
+            reference_context_item: None,
+            context_strategy: NextTurnContextStrategy::FullInitialContext {
+                model_switch_message: false,
+                memory_prompt: false,
+                developer_instructions: false,
+                user_instructions: false,
+            },
+            latest_compaction_summary: None,
+            latest_compaction_replacement_items: None,
+            memory_prompt_available: false,
+            memory_summary_tokens_estimate: None,
+            developer_instructions_present: false,
+            user_instructions_present: false,
+            prompt_sections: Vec::new(),
+            history_tail: Vec::new(),
+        };
 
-        let analysis = analyze_rollout(&reconstructed_items, &raw_rollout_lines, 2);
+        let analysis =
+            analyze_rollout(&reconstructed_items, &raw_rollout_lines, &prompt_preview, 2);
         assert_eq!(
             analysis.recent_user_messages,
             vec!["first request".to_string(), "second request".to_string()]
@@ -1010,6 +1247,9 @@ mod tests {
             recent_user_messages: vec!["do task".to_string()],
             recent_assistant_messages: vec!["task done".to_string()],
             durable_guidance: vec!["always prefer source-backed fixes".to_string()],
+            prompt_reconstruction_notes: vec![
+                "- Reconstructed model-visible history items: 12".to_string(),
+            ],
             recent_warnings: vec![],
             recent_errors: vec!["failure".to_string()],
         };
@@ -1017,6 +1257,7 @@ mod tests {
         let brief = build_distilled_brief(&summary(), &analysis);
         assert!(brief.contains("# Source Thread"));
         assert!(brief.contains("# Existing Compaction Summary"));
+        assert!(brief.contains("# Next-Turn Prompt Reconstruction"));
         assert!(brief.contains("# Recent User Requests"));
         assert!(brief.contains("# Recent Assistant Outcomes"));
         assert!(brief.contains("# Recent Warnings And Errors"));
@@ -1029,6 +1270,7 @@ mod tests {
             recent_user_messages: vec!["one".to_string()],
             recent_assistant_messages: vec!["two".to_string()],
             durable_guidance: vec![],
+            prompt_reconstruction_notes: vec![],
             recent_warnings: vec![],
             recent_errors: vec![],
         };

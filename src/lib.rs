@@ -7,6 +7,8 @@ mod cli;
 mod commands;
 mod distill;
 mod operations;
+mod preview;
+mod progress;
 mod rollout_edit;
 mod runtime;
 mod smart;

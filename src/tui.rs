@@ -1,8 +1,14 @@
 use crate::cli::Cli;
 use crate::cli::Command;
 use crate::cli::DistillArgs;
+use crate::cli::FirstTokenPreviewArgs;
 use crate::cli::SmartArgs;
 use crate::distill;
+use crate::preview;
+use crate::progress::DistillProgressEvent;
+use crate::progress::OperationProgressEvent;
+use crate::progress::SmartProgressEvent;
+use crate::progress::SmartStrategyKind;
 use crate::run_command;
 use crate::runtime::load_runtime_config;
 use crate::runtime::shell_quote;
@@ -57,6 +63,8 @@ use std::io;
 use std::io::Stdout;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -99,90 +107,19 @@ pub(crate) async fn run() -> Result<()> {
                 app.status = Some(status);
                 app.reload(selection).await?;
             }
-            UiEffect::RunSmart(args) => match smart::prepare_execution((*args).clone()).await {
-                Ok(prepared) => {
-                    terminal.suspend()?;
-                    let selection = smart::pick_selection(&prepared).await;
-                    terminal.resume()?;
-                    match selection {
-                        Ok(Some(selection)) => {
-                            app.mode = Mode::Result(smart_processing_result(app.language));
-                            terminal.terminal.clear()?;
-                            terminal.draw(&mut app)?;
-                            match smart::execute_prepared(prepared, selection).await {
-                                Ok(result) => {
-                                    let selection = preferred_selection(
-                                        result.preferred_thread_id.as_deref(),
-                                        result.preferred_rollout_path.as_ref(),
-                                    );
-                                    app.reload(selection).await?;
-                                    app.mode = Mode::Result(ResultViewState {
-                                        title: localize_known_result_title(
-                                            app.language,
-                                            result.title.as_str(),
-                                        ),
-                                        lines: result.lines,
-                                        scroll: 0,
-                                    });
-                                    terminal.terminal.clear()?;
-                                }
-                                Err(error) => {
-                                    app.mode = Mode::Result(error_result_state(
-                                        app.language,
-                                        "Smart Switch Failed",
-                                        "Smart 切换失败",
-                                        &error,
-                                    ));
-                                    terminal.terminal.clear()?;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            app.mode = Mode::Browsing;
-                            app.status = Some(match app.language {
-                                Language::English => "Smart switch cancelled".to_string(),
-                                Language::Chinese => "已取消 smart 切换".to_string(),
-                            });
-                        }
-                        Err(error) => {
-                            app.mode = Mode::Result(error_result_state(
-                                app.language,
-                                "Smart Picker Failed",
-                                "Smart 选择器失败",
-                                &error,
-                            ));
-                            terminal.terminal.clear()?;
-                        }
-                    }
-                }
-                Err(error) => {
-                    app.mode = Mode::Result(error_result_state(
-                        app.language,
-                        "Smart Setup Failed",
-                        "Smart 初始化失败",
-                        &error,
-                    ));
-                    terminal.terminal.clear()?;
-                }
-            },
-            UiEffect::RunDistill(args) => {
-                app.mode = Mode::Result(distill_processing_result(app.language));
+            UiEffect::RunFirstTokenPreview(args) => {
+                app.mode = Mode::Result(preview_processing_result(app.language));
                 terminal.terminal.clear()?;
                 terminal.draw(&mut app)?;
-                match distill::execute(*args).await {
+                match preview::execute(*args).await {
                     Ok(output) => {
-                        let selection = preferred_selection(
-                            output.successor_thread_id.as_deref(),
-                            output.successor_rollout_path.as_ref(),
-                        );
-                        app.reload(selection).await?;
                         app.mode = Mode::Result(ResultViewState {
                             title: localized_heading_text(
                                 app.language,
-                                "Distilled Successor Ready",
-                                "提炼结果已生成",
+                                "First Token Preview",
+                                "首轮上下文预览",
                             ),
-                            lines: distill::render_output_lines(&output),
+                            lines: preview::render_output_lines(&output),
                             scroll: 0,
                         });
                         terminal.terminal.clear()?;
@@ -190,13 +127,19 @@ pub(crate) async fn run() -> Result<()> {
                     Err(error) => {
                         app.mode = Mode::Result(error_result_state(
                             app.language,
-                            "Distillation Failed",
-                            "提炼失败",
+                            "First Token Preview Failed",
+                            "首轮上下文预览失败",
                             &error,
                         ));
                         terminal.terminal.clear()?;
                     }
                 }
+            }
+            UiEffect::RunSmart(args) => {
+                run_smart_with_progress(&mut terminal, &mut app, *args).await?
+            }
+            UiEffect::RunDistill(args) => {
+                run_distill_with_progress(&mut terminal, &mut app, *args).await?
             }
         }
 
@@ -414,6 +357,7 @@ impl Catalog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Show,
+    FirstTokenPreview,
     Rename,
     Repair,
     RewriteMeta,
@@ -466,6 +410,7 @@ enum UiEffect {
     Quit,
     Reload,
     Execute(Box<PreparedCommand>),
+    RunFirstTokenPreview(Box<FirstTokenPreviewArgs>),
     RunSmart(Box<SmartArgs>),
     RunDistill(Box<DistillArgs>),
 }
@@ -595,6 +540,9 @@ impl AppState {
                         self.mode = Mode::Browsing;
                         let prepared = prepare_command(action, &thread, "")?;
                         match prepared.command {
+                            Command::FirstTokenPreview(args) => {
+                                Ok(UiEffect::RunFirstTokenPreview(Box::new(args)))
+                            }
                             Command::Smart(args) => Ok(UiEffect::RunSmart(Box::new(args))),
                             _ => Ok(UiEffect::Execute(Box::new(prepared))),
                         }
@@ -635,6 +583,9 @@ impl AppState {
                 Ok(prepared) => {
                     self.mode = Mode::Browsing;
                     match prepared.command {
+                        Command::FirstTokenPreview(args) => {
+                            Ok(UiEffect::RunFirstTokenPreview(Box::new(args)))
+                        }
                         Command::Distill(args) => Ok(UiEffect::RunDistill(Box::new(args))),
                         _ => Ok(UiEffect::Execute(Box::new(prepared))),
                     }
@@ -847,6 +798,7 @@ impl Action {
     fn all() -> &'static [Action] {
         &[
             Action::Show,
+            Action::FirstTokenPreview,
             Action::Rename,
             Action::Repair,
             Action::RewriteMeta,
@@ -869,6 +821,7 @@ impl Action {
     fn label(self) -> &'static str {
         match self {
             Action::Show => "show",
+            Action::FirstTokenPreview => "first-token-preview",
             Action::Rename => "rename",
             Action::Repair => "repair",
             Action::RewriteMeta => "rewrite-meta",
@@ -891,6 +844,9 @@ impl Action {
     fn description(self, language: Language) -> &'static str {
         match (self, language) {
             (Action::Show, Language::English) => "Inspect derived metadata for this thread",
+            (Action::FirstTokenPreview, Language::English) => {
+                "Preview the next model-visible prompt built on resume"
+            }
             (Action::Rename, Language::English) => {
                 "Append a new thread title into session_index.jsonl"
             }
@@ -922,6 +878,9 @@ impl Action {
                 "Create a lighter successor session from a heavy source thread"
             }
             (Action::Show, Language::Chinese) => "查看这个线程的派生摘要信息",
+            (Action::FirstTokenPreview, Language::Chinese) => {
+                "预览 resume 后下一轮真正发送给模型的上下文"
+            }
             (Action::Rename, Language::Chinese) => "向 session_index.jsonl 追加新的线程标题",
             (Action::Repair, Language::Chinese) => "根据 rollout 历史修复 SQLite 元数据",
             (Action::RewriteMeta, Language::Chinese) => "重写第一条 SessionMeta 记录",
@@ -948,6 +907,7 @@ impl Action {
     fn input_kind(self) -> ActionInputKind {
         match self {
             Action::Show
+            | Action::FirstTokenPreview
             | Action::Repair
             | Action::Archive
             | Action::Unarchive
@@ -985,6 +945,7 @@ impl Action {
             ),
             (Action::Distill, _) => Some("--preview-only"),
             (Action::Show, _)
+            | (Action::FirstTokenPreview, _)
             | (Action::Repair, _)
             | (Action::Archive, _)
             | (Action::Unarchive, _)
@@ -1686,34 +1647,674 @@ fn preferred_selection(
         })
 }
 
-fn smart_processing_result(language: Language) -> ResultViewState {
-    ResultViewState {
-        title: localized_heading_text(
-            language,
-            "Smart Switch In Progress",
-            "Smart 切换进行中",
-        ),
-        lines: vec![match language {
-            Language::English => {
-                "Executing the selected smart workflow. This may compact, repair, migrate, or distill before the final result page appears.".to_string()
-            }
-            Language::Chinese => {
-                "正在执行已选择的 smart 流程。它可能会进行压缩、修复、迁移或提炼，完成后会停留在结果页。".to_string()
-            }
-        }],
-        scroll: 0,
+#[derive(Default)]
+struct OperationLog {
+    lines: Vec<String>,
+}
+
+impl OperationLog {
+    fn push(&mut self, line: String) {
+        let next_index = self.lines.len() + 1;
+        self.lines.push(format!("{next_index}. {line}"));
+    }
+
+    fn processing_lines(&self, language: Language) -> Vec<String> {
+        if self.lines.is_empty() {
+            vec![match language {
+                Language::English => "Waiting for the first progress event...".to_string(),
+                Language::Chinese => "等待第一条进度事件……".to_string(),
+            }]
+        } else {
+            self.lines.clone()
+        }
+    }
+
+    fn final_lines(&self, language: Language, mut result_lines: Vec<String>) -> Vec<String> {
+        if self.lines.is_empty() {
+            return result_lines;
+        }
+        result_lines.push(String::new());
+        result_lines.push(match language {
+            Language::English => "operation_log:".to_string(),
+            Language::Chinese => "处理日志：".to_string(),
+        });
+        result_lines.extend(self.lines.iter().map(|line| format!("- {line}")));
+        result_lines
     }
 }
 
-fn distill_processing_result(language: Language) -> ResultViewState {
+fn processing_scroll(lines: &[String]) -> usize {
+    lines.len()
+}
+
+fn drain_progress_events(
+    receiver: &mpsc::Receiver<OperationProgressEvent>,
+    log: &mut OperationLog,
+    language: Language,
+) -> Result<bool> {
+    let mut updated = false;
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                log.push(format_progress_event(language, &event));
+                updated = true;
+            }
+            Err(TryRecvError::Empty) => return Ok(updated),
+            Err(TryRecvError::Disconnected) => return Ok(updated),
+        }
+    }
+}
+
+async fn run_distill_with_progress(
+    terminal: &mut TerminalSession,
+    app: &mut AppState,
+    args: DistillArgs,
+) -> Result<()> {
+    let (sender, receiver) = mpsc::channel();
+    let mut log = OperationLog::default();
+    app.mode = Mode::Result(smart_or_distill_processing_result(
+        app.language,
+        false,
+        log.processing_lines(app.language),
+    ));
+    terminal.terminal.clear()?;
+    terminal.draw(app)?;
+    let task =
+        tokio::spawn(async move { distill::execute_with_progress(args, Some(sender)).await });
+    loop {
+        let updated = drain_progress_events(&receiver, &mut log, app.language)?;
+        if updated {
+            app.mode = Mode::Result(smart_or_distill_processing_result(
+                app.language,
+                false,
+                log.processing_lines(app.language),
+            ));
+            terminal.draw(app)?;
+        }
+        if task.is_finished() {
+            let result = match task.await {
+                Ok(result) => result,
+                Err(error) => {
+                    let mut state = error_result_state(
+                        app.language,
+                        "Distillation Failed",
+                        "提炼失败",
+                        &anyhow::anyhow!("distill task panicked: {error}"),
+                    );
+                    state.lines = log.final_lines(app.language, state.lines);
+                    app.mode = Mode::Result(state);
+                    terminal.terminal.clear()?;
+                    return Ok(());
+                }
+            };
+            let updated = drain_progress_events(&receiver, &mut log, app.language)?;
+            if updated {
+                app.mode = Mode::Result(smart_or_distill_processing_result(
+                    app.language,
+                    false,
+                    log.processing_lines(app.language),
+                ));
+                terminal.draw(app)?;
+            }
+            match result {
+                Ok(output) => {
+                    let selection = preferred_selection(
+                        output.successor_thread_id.as_deref(),
+                        output.successor_rollout_path.as_ref(),
+                    );
+                    app.reload(selection).await?;
+                    app.mode = Mode::Result(ResultViewState {
+                        title: localized_heading_text(
+                            app.language,
+                            "Distilled Successor Ready",
+                            "提炼结果已生成",
+                        ),
+                        lines: log.final_lines(app.language, distill::render_output_lines(&output)),
+                        scroll: 0,
+                    });
+                    terminal.terminal.clear()?;
+                }
+                Err(error) => {
+                    let mut state =
+                        error_result_state(app.language, "Distillation Failed", "提炼失败", &error);
+                    state.lines = log.final_lines(app.language, state.lines);
+                    app.mode = Mode::Result(state);
+                    terminal.terminal.clear()?;
+                }
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+}
+
+async fn run_smart_with_progress(
+    terminal: &mut TerminalSession,
+    app: &mut AppState,
+    args: SmartArgs,
+) -> Result<()> {
+    match smart::prepare_execution(args.clone()).await {
+        Ok(prepared) => {
+            terminal.suspend()?;
+            let selection = smart::pick_selection(&prepared).await;
+            terminal.resume()?;
+            match selection {
+                Ok(Some(selection)) => {
+                    let (sender, receiver) = mpsc::channel();
+                    let mut log = OperationLog::default();
+                    app.mode = Mode::Result(smart_or_distill_processing_result(
+                        app.language,
+                        true,
+                        log.processing_lines(app.language),
+                    ));
+                    terminal.terminal.clear()?;
+                    terminal.draw(app)?;
+                    let task = tokio::spawn(async move {
+                        smart::execute_prepared_with_progress(prepared, selection, Some(sender))
+                            .await
+                    });
+                    loop {
+                        let updated = drain_progress_events(&receiver, &mut log, app.language)?;
+                        if updated {
+                            app.mode = Mode::Result(smart_or_distill_processing_result(
+                                app.language,
+                                true,
+                                log.processing_lines(app.language),
+                            ));
+                            terminal.draw(app)?;
+                        }
+                        if task.is_finished() {
+                            let result = match task.await {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    let mut state = error_result_state(
+                                        app.language,
+                                        "Smart Switch Failed",
+                                        "Smart 切换失败",
+                                        &anyhow::anyhow!("smart task panicked: {error}"),
+                                    );
+                                    state.lines = log.final_lines(app.language, state.lines);
+                                    app.mode = Mode::Result(state);
+                                    terminal.terminal.clear()?;
+                                    return Ok(());
+                                }
+                            };
+                            let updated = drain_progress_events(&receiver, &mut log, app.language)?;
+                            if updated {
+                                app.mode = Mode::Result(smart_or_distill_processing_result(
+                                    app.language,
+                                    true,
+                                    log.processing_lines(app.language),
+                                ));
+                                terminal.draw(app)?;
+                            }
+                            match result {
+                                Ok(result) => {
+                                    let selection = preferred_selection(
+                                        result.preferred_thread_id.as_deref(),
+                                        result.preferred_rollout_path.as_ref(),
+                                    );
+                                    app.reload(selection).await?;
+                                    app.mode = Mode::Result(ResultViewState {
+                                        title: localize_known_result_title(
+                                            app.language,
+                                            result.title.as_str(),
+                                        ),
+                                        lines: log.final_lines(app.language, result.lines),
+                                        scroll: 0,
+                                    });
+                                    terminal.terminal.clear()?;
+                                }
+                                Err(error) => {
+                                    let mut state = error_result_state(
+                                        app.language,
+                                        "Smart Switch Failed",
+                                        "Smart 切换失败",
+                                        &error,
+                                    );
+                                    state.lines = log.final_lines(app.language, state.lines);
+                                    app.mode = Mode::Result(state);
+                                    terminal.terminal.clear()?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                    }
+                }
+                Ok(None) => {
+                    app.mode = Mode::Browsing;
+                    app.status = Some(match app.language {
+                        Language::English => "Smart switch cancelled".to_string(),
+                        Language::Chinese => "已取消 smart 切换".to_string(),
+                    });
+                    Ok(())
+                }
+                Err(error) => {
+                    app.mode = Mode::Result(error_result_state(
+                        app.language,
+                        "Smart Picker Failed",
+                        "Smart 选择器失败",
+                        &error,
+                    ));
+                    terminal.terminal.clear()?;
+                    Ok(())
+                }
+            }
+        }
+        Err(error) => {
+            app.mode = Mode::Result(error_result_state(
+                app.language,
+                "Smart Setup Failed",
+                "Smart 初始化失败",
+                &error,
+            ));
+            terminal.terminal.clear()?;
+            Ok(())
+        }
+    }
+}
+
+fn format_progress_event(language: Language, event: &OperationProgressEvent) -> String {
+    match event {
+        OperationProgressEvent::Distill(event) => format_distill_progress(language, event),
+        OperationProgressEvent::Smart(event) => format_smart_progress(language, event),
+    }
+}
+
+fn format_distill_progress(language: Language, event: &DistillProgressEvent) -> String {
+    match (language, event) {
+        (Language::English, DistillProgressEvent::ResolvingTarget) => {
+            "Resolving the source thread target.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::ResolvingTarget) => {
+            "正在解析源线程目标。".to_string()
+        }
+        (Language::English, DistillProgressEvent::LoadingSessionSummary) => {
+            "Loading the current session summary.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::LoadingSessionSummary) => {
+            "正在加载当前会话摘要。".to_string()
+        }
+        (Language::English, DistillProgressEvent::RebuildingHistory) => {
+            "Reconstructing rollout history.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::RebuildingHistory) => {
+            "正在重建 rollout 历史。".to_string()
+        }
+        (Language::English, DistillProgressEvent::ReadingRolloutLines) => {
+            "Reading raw rollout lines.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::ReadingRolloutLines) => {
+            "正在读取原始 rollout 行。".to_string()
+        }
+        (
+            Language::English,
+            DistillProgressEvent::AnalyzingHistory {
+                history_items,
+                raw_lines,
+            },
+        ) => format!(
+            "Analyzing history signals from {history_items} items and {raw_lines} raw lines."
+        ),
+        (
+            Language::Chinese,
+            DistillProgressEvent::AnalyzingHistory {
+                history_items,
+                raw_lines,
+            },
+        ) => format!("正在分析历史信号：{history_items} 条历史项，{raw_lines} 条原始行。"),
+        (Language::English, DistillProgressEvent::BuildingDeterministicBrief) => {
+            "Building the deterministic handoff brief.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::BuildingDeterministicBrief) => {
+            "正在生成规则提炼 handoff。".to_string()
+        }
+        (
+            Language::English,
+            DistillProgressEvent::DeterministicBriefReady {
+                user_messages,
+                assistant_messages,
+                durable_guidance,
+                estimated_tokens,
+            },
+        ) => format!(
+            "Deterministic distill ready: kept {user_messages} user messages, {assistant_messages} assistant messages, {durable_guidance} durable guidance items, about {estimated_tokens} tokens."
+        ),
+        (
+            Language::Chinese,
+            DistillProgressEvent::DeterministicBriefReady {
+                user_messages,
+                assistant_messages,
+                durable_guidance,
+                estimated_tokens,
+            },
+        ) => format!(
+            "规则提炼完成：保留 {user_messages} 条用户消息、{assistant_messages} 条助手消息、{durable_guidance} 条长期约束，约 {estimated_tokens} tokens。"
+        ),
+        (Language::English, DistillProgressEvent::ResolvingRuntimeConfig) => {
+            "Resolving the target runtime configuration.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::ResolvingRuntimeConfig) => {
+            "正在解析目标运行时配置。".to_string()
+        }
+        (Language::English, DistillProgressEvent::StartingCodexDistillation) => {
+            "Starting Codex second-pass distillation.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::StartingCodexDistillation) => {
+            "正在启动 Codex 二次蒸馏。".to_string()
+        }
+        (Language::English, DistillProgressEvent::CodexEphemeralThreadStarted) => {
+            "Ephemeral Codex distillation thread started.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::CodexEphemeralThreadStarted) => {
+            "已启动临时 Codex 蒸馏线程。".to_string()
+        }
+        (Language::English, DistillProgressEvent::CodexTurnSubmitted) => {
+            "Submitted the AI distillation prompt; waiting for completion.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::CodexTurnSubmitted) => {
+            "已提交 AI 蒸馏提示词，等待完成。".to_string()
+        }
+        (
+            Language::English,
+            DistillProgressEvent::CodexDistillationCompleted { estimated_tokens },
+        ) => format!("AI distillation completed at about {estimated_tokens} tokens."),
+        (
+            Language::Chinese,
+            DistillProgressEvent::CodexDistillationCompleted { estimated_tokens },
+        ) => format!("AI 蒸馏完成，结果约 {estimated_tokens} tokens。"),
+        (
+            Language::English,
+            DistillProgressEvent::CodexDistillationFallback {
+                error,
+                estimated_tokens,
+            },
+        ) => format!(
+            "AI distillation failed; fell back to deterministic brief at about {estimated_tokens} tokens. Cause: {error}"
+        ),
+        (
+            Language::Chinese,
+            DistillProgressEvent::CodexDistillationFallback {
+                error,
+                estimated_tokens,
+            },
+        ) => format!(
+            "AI 蒸馏失败，已回退到规则提炼结果，约 {estimated_tokens} tokens。原因：{error}"
+        ),
+        (Language::English, DistillProgressEvent::BuildingReport) => {
+            "Building the distillation report.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::BuildingReport) => {
+            "正在生成提炼报告。".to_string()
+        }
+        (Language::English, DistillProgressEvent::PreviewReady) => {
+            "Preview is ready; no successor thread will be created.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::PreviewReady) => {
+            "预览结果已生成；不会创建继任线程。".to_string()
+        }
+        (Language::English, DistillProgressEvent::WritingProfile { profile }) => {
+            format!("Writing resolved runtime into profile `{profile}`.")
+        }
+        (Language::Chinese, DistillProgressEvent::WritingProfile { profile }) => {
+            format!("正在把解析后的运行时写入 profile `{profile}`。")
+        }
+        (Language::English, DistillProgressEvent::StartingSuccessorThread) => {
+            "Starting the distilled successor thread.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::StartingSuccessorThread) => {
+            "正在创建提炼后的继任线程。".to_string()
+        }
+        (Language::English, DistillProgressEvent::SuccessorThreadNamed { thread_name }) => {
+            format!("Assigned successor thread name `{thread_name}`.")
+        }
+        (Language::Chinese, DistillProgressEvent::SuccessorThreadNamed { thread_name }) => {
+            format!("已设置继任线程标题：`{thread_name}`。")
+        }
+        (Language::English, DistillProgressEvent::SeedingSuccessorThread) => {
+            "Submitting the handoff seed turn to the successor thread.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::SeedingSuccessorThread) => {
+            "正在向继任线程提交 handoff seed turn。".to_string()
+        }
+        (Language::English, DistillProgressEvent::SeedTurnCompleted) => {
+            "Successor seed turn completed.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::SeedTurnCompleted) => {
+            "继任线程的 seed turn 已完成。".to_string()
+        }
+        (Language::English, DistillProgressEvent::ArchivingSource) => {
+            "Archiving the source rollout.".to_string()
+        }
+        (Language::Chinese, DistillProgressEvent::ArchivingSource) => {
+            "正在归档源 rollout。".to_string()
+        }
+        (
+            Language::English,
+            DistillProgressEvent::Completed {
+                preview_only,
+                successor_thread_id,
+            },
+        ) => match (preview_only, successor_thread_id.as_deref()) {
+            (true, _) => "Distill flow completed in preview mode.".to_string(),
+            (false, Some(thread_id)) => {
+                format!("Distill flow completed; successor thread id: {thread_id}.")
+            }
+            (false, None) => "Distill flow completed.".to_string(),
+        },
+        (
+            Language::Chinese,
+            DistillProgressEvent::Completed {
+                preview_only,
+                successor_thread_id,
+            },
+        ) => match (preview_only, successor_thread_id.as_deref()) {
+            (true, _) => "提炼流程已完成，当前是预览模式。".to_string(),
+            (false, Some(thread_id)) => format!("提炼流程已完成；继任线程 ID：{thread_id}。"),
+            (false, None) => "提炼流程已完成。".to_string(),
+        },
+    }
+}
+
+fn format_smart_progress(language: Language, event: &SmartProgressEvent) -> String {
+    match (language, event) {
+        (
+            Language::English,
+            SmartProgressEvent::StrategyConfirmed {
+                strategy,
+                provider,
+                model,
+                target_context_window,
+            },
+        ) => format!(
+            "Smart strategy confirmed: {} -> provider `{provider}`, model `{model}`, target window {}.",
+            smart_strategy_label_en(*strategy),
+            target_context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        (
+            Language::Chinese,
+            SmartProgressEvent::StrategyConfirmed {
+                strategy,
+                provider,
+                model,
+                target_context_window,
+            },
+        ) => format!(
+            "Smart 策略已确认：{} -> provider `{provider}`，model `{model}`，目标窗口 {}。",
+            smart_strategy_label_zh(*strategy),
+            target_context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        ),
+        (Language::English, SmartProgressEvent::StartingDistill { mode }) => format!(
+            "Delegating to the distill pipeline in `{}` mode.",
+            match mode {
+                crate::cli::DistillMode::Codex => "codex",
+                crate::cli::DistillMode::Deterministic => "deterministic",
+            }
+        ),
+        (Language::Chinese, SmartProgressEvent::StartingDistill { mode }) => format!(
+            "正在进入 distill 流程，模式：{}。",
+            match mode {
+                crate::cli::DistillMode::Codex => "Codex 提炼",
+                crate::cli::DistillMode::Deterministic => "规则提炼",
+            }
+        ),
+        (
+            Language::English,
+            SmartProgressEvent::CheckingContextWindow {
+                current_tokens,
+                target_window,
+            },
+        ) => format!(
+            "Checking context pressure: current tokens {current_tokens}, target window {target_window}."
+        ),
+        (
+            Language::Chinese,
+            SmartProgressEvent::CheckingContextWindow {
+                current_tokens,
+                target_window,
+            },
+        ) => {
+            format!("正在检查上下文压力：当前 {current_tokens} tokens，目标窗口 {target_window}。")
+        }
+        (
+            Language::English,
+            SmartProgressEvent::RunningCompaction {
+                attempt,
+                max_attempts,
+            },
+        ) => format!("Running pre-switch compaction {attempt}/{max_attempts}."),
+        (
+            Language::Chinese,
+            SmartProgressEvent::RunningCompaction {
+                attempt,
+                max_attempts,
+            },
+        ) => format!("正在执行切换前压缩 {attempt}/{max_attempts}。"),
+        (Language::English, SmartProgressEvent::ReloadingSummaryAfterCompaction { attempt }) => {
+            format!("Reloading session summary after compaction {attempt}.")
+        }
+        (Language::Chinese, SmartProgressEvent::ReloadingSummaryAfterCompaction { attempt }) => {
+            format!("正在重新加载压缩 {attempt} 后的会话摘要。")
+        }
+        (Language::English, SmartProgressEvent::WritingProfile { profile }) => {
+            format!("Writing the resolved runtime into profile `{profile}`.")
+        }
+        (Language::Chinese, SmartProgressEvent::WritingProfile { profile }) => {
+            format!("正在把解析后的运行时写入 profile `{profile}`。")
+        }
+        (
+            Language::English,
+            SmartProgressEvent::RepairingResumeState {
+                provider,
+                model,
+                context_window,
+            },
+        ) => format!(
+            "Repairing persisted resume state for provider `{provider}`, model `{model}`, context window {}.",
+            context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        (
+            Language::Chinese,
+            SmartProgressEvent::RepairingResumeState {
+                provider,
+                model,
+                context_window,
+            },
+        ) => format!(
+            "正在修复持久化 resume 状态：provider `{provider}`，model `{model}`，上下文窗口 {}。",
+            context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        ),
+        (Language::English, SmartProgressEvent::SnapshottingThreadList) => {
+            "Snapshotting the existing thread list before migration.".to_string()
+        }
+        (Language::Chinese, SmartProgressEvent::SnapshottingThreadList) => {
+            "正在为迁移前的线程列表建立快照。".to_string()
+        }
+        (Language::English, SmartProgressEvent::RunningMigration) => {
+            "Running cross-provider migration.".to_string()
+        }
+        (Language::Chinese, SmartProgressEvent::RunningMigration) => {
+            "正在执行跨 provider 迁移。".to_string()
+        }
+        (Language::English, SmartProgressEvent::RefreshingThreadList) => {
+            "Refreshing the thread list to locate the successor thread.".to_string()
+        }
+        (Language::Chinese, SmartProgressEvent::RefreshingThreadList) => {
+            "正在刷新线程列表以定位继任线程。".to_string()
+        }
+        (Language::English, SmartProgressEvent::Completed { thread_id }) => match thread_id {
+            Some(thread_id) => format!("Smart flow completed; selected thread id: {thread_id}."),
+            None => "Smart flow completed.".to_string(),
+        },
+        (Language::Chinese, SmartProgressEvent::Completed { thread_id }) => match thread_id {
+            Some(thread_id) => format!("Smart 流程已完成；目标线程 ID：{thread_id}。"),
+            None => "Smart 流程已完成。".to_string(),
+        },
+    }
+}
+
+fn smart_strategy_label_en(strategy: SmartStrategyKind) -> &'static str {
+    match strategy {
+        SmartStrategyKind::SameThreadProfileOnly => "same-thread profile update",
+        SmartStrategyKind::SameThreadRepair => "same-thread repair",
+        SmartStrategyKind::SameThreadRepairAfterCompaction => "same-thread compact then repair",
+        SmartStrategyKind::CrossProviderMigrate => "cross-provider migrate",
+        SmartStrategyKind::CrossProviderMigrateAfterCompaction => {
+            "cross-provider compact then migrate"
+        }
+        SmartStrategyKind::DistillSuccessor => "distill successor session",
+    }
+}
+
+fn smart_strategy_label_zh(strategy: SmartStrategyKind) -> &'static str {
+    match strategy {
+        SmartStrategyKind::SameThreadProfileOnly => "同线程仅更新 profile",
+        SmartStrategyKind::SameThreadRepair => "同线程修复",
+        SmartStrategyKind::SameThreadRepairAfterCompaction => "同线程先压缩再修复",
+        SmartStrategyKind::CrossProviderMigrate => "跨 provider 迁移",
+        SmartStrategyKind::CrossProviderMigrateAfterCompaction => "跨 provider 先压缩再迁移",
+        SmartStrategyKind::DistillSuccessor => "提炼轻量继任会话",
+    }
+}
+
+fn smart_or_distill_processing_result(
+    language: Language,
+    is_smart: bool,
+    lines: Vec<String>,
+) -> ResultViewState {
     ResultViewState {
-        title: localized_heading_text(language, "Distillation In Progress", "提炼进行中"),
+        title: if is_smart {
+            localized_heading_text(language, "Smart Switch In Progress", "Smart 切换进行中")
+        } else {
+            localized_heading_text(language, "Distillation In Progress", "提炼进行中")
+        },
+        scroll: processing_scroll(lines.as_slice()),
+        lines,
+    }
+}
+
+fn preview_processing_result(language: Language) -> ResultViewState {
+    ResultViewState {
+        title: localized_heading_text(
+            language,
+            "First Token Preview In Progress",
+            "首轮上下文预览进行中",
+        ),
         lines: vec![match language {
             Language::English => {
-                "Building a successor-session handoff. Codex-backed distillation may take longer than deterministic mode.".to_string()
+                "Reconstructing the next model-visible prompt from rollout history, compaction state, and runtime context.".to_string()
             }
             Language::Chinese => {
-                "正在生成继任会话 handoff。Codex 提炼模式通常会比规则提炼更慢。".to_string()
+                "正在根据 rollout 历史、compact 状态和当前运行时上下文重建下一轮真正发送给模型的提示词。".to_string()
             }
         }],
         scroll: 0,
@@ -2170,6 +2771,20 @@ mod tests {
                 "yunyi".to_string(),
                 "--thread-name".to_string(),
                 "迁移 256k".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_command_argv_supports_first_token_preview_without_extra_flags() {
+        let argv = build_command_argv(Action::FirstTokenPreview, &sample_thread(), "")
+            .expect("build command argv");
+        assert_eq!(
+            argv,
+            vec![
+                "codex-session-manager".to_string(),
+                "first-token-preview".to_string(),
+                "019cd66f-f4ea-7022-802b-7007c11cea97".to_string(),
             ]
         );
     }

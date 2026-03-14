@@ -5,6 +5,11 @@ use crate::cli::MigrateArgs;
 use crate::cli::RepairResumeStateArgs;
 use crate::cli::SmartArgs;
 use crate::distill;
+use crate::progress::OperationProgressEvent;
+use crate::progress::ProgressSender;
+use crate::progress::SmartProgressEvent;
+use crate::progress::SmartStrategyKind;
+use crate::progress::emit_progress;
 use crate::run_command;
 use crate::runtime::load_runtime_config;
 use crate::runtime::render_profiled_resume_command;
@@ -126,11 +131,20 @@ pub(crate) async fn execute_prepared(
     prepared: PreparedSmartExecution,
     selection: SmartSelection,
 ) -> Result<SmartExecutionOutput> {
+    execute_prepared_with_progress(prepared, selection, None).await
+}
+
+pub(crate) async fn execute_prepared_with_progress(
+    prepared: PreparedSmartExecution,
+    selection: SmartSelection,
+    progress: Option<ProgressSender>,
+) -> Result<SmartExecutionOutput> {
     execute_selection(
         prepared.args,
         prepared.source_config,
         prepared.summary,
         selection,
+        progress,
     )
     .await
 }
@@ -140,6 +154,7 @@ async fn execute_selection(
     source_config: Config,
     mut summary: crate::types::SessionSummary,
     selection: SmartSelection,
+    progress: Option<ProgressSender>,
 ) -> Result<SmartExecutionOutput> {
     let target_args = args.target.clone();
     let current_provider = summary
@@ -158,32 +173,70 @@ async fn execute_selection(
             selection.target_context_window,
         )
     });
+    let strategy = planned_strategy(
+        &summary,
+        current_provider.as_str(),
+        current_model.as_str(),
+        &selection,
+    );
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Smart(SmartProgressEvent::StrategyConfirmed {
+            strategy,
+            provider: selection.provider.clone(),
+            model: selection.model.clone(),
+            target_context_window: selection.target_context_window,
+        }),
+    );
 
     if matches!(
         selection.execution_mode,
         SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic
     ) {
-        let output = distill::execute(DistillArgs {
-            target: args.target,
-            provider: Some(selection.provider),
-            model: Some(selection.model),
-            context_window: selection.target_context_window,
-            auto_compact_token_limit: selection.target_auto_compact_token_limit,
-            distill_mode: match selection.execution_mode {
-                SmartExecutionMode::DistillCodex => crate::cli::DistillMode::Codex,
-                SmartExecutionMode::DistillDeterministic => crate::cli::DistillMode::Deterministic,
-                SmartExecutionMode::Direct => unreachable!(),
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Smart(SmartProgressEvent::StartingDistill {
+                mode: match selection.execution_mode {
+                    SmartExecutionMode::DistillCodex => crate::cli::DistillMode::Codex,
+                    SmartExecutionMode::DistillDeterministic => {
+                        crate::cli::DistillMode::Deterministic
+                    }
+                    SmartExecutionMode::Direct => unreachable!(),
+                },
+            }),
+        );
+        let output = distill::execute_with_progress(
+            DistillArgs {
+                target: args.target,
+                provider: Some(selection.provider),
+                model: Some(selection.model),
+                context_window: selection.target_context_window,
+                auto_compact_token_limit: selection.target_auto_compact_token_limit,
+                distill_mode: match selection.execution_mode {
+                    SmartExecutionMode::DistillCodex => crate::cli::DistillMode::Codex,
+                    SmartExecutionMode::DistillDeterministic => {
+                        crate::cli::DistillMode::Deterministic
+                    }
+                    SmartExecutionMode::Direct => unreachable!(),
+                },
+                reasoning_effort: None,
+                thread_name: summary.thread_name.clone(),
+                write_profile: Some(target_profile.clone()),
+                archive_source: args.archive_source,
+                preview_only: false,
+                json: false,
+                recent_turns: 8,
+                timeout_secs: args.timeout_secs,
             },
-            reasoning_effort: None,
-            thread_name: summary.thread_name.clone(),
-            write_profile: Some(target_profile.clone()),
-            archive_source: args.archive_source,
-            preview_only: false,
-            json: false,
-            recent_turns: 8,
-            timeout_secs: args.timeout_secs,
-        })
+            progress.clone(),
+        )
         .await?;
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Smart(SmartProgressEvent::Completed {
+                thread_id: output.successor_thread_id.clone(),
+            }),
+        );
         return Ok(SmartExecutionOutput {
             title: "Distilled Successor Ready".to_string(),
             lines: distill::render_output_lines(&output),
@@ -196,6 +249,13 @@ async fn execute_selection(
         let mut compactions_run = 0_u32;
         if let Some(target_window) = selection.target_context_window {
             while let Some(context_tokens) = summary.latest_context_tokens {
+                emit_progress(
+                    progress.as_ref(),
+                    OperationProgressEvent::Smart(SmartProgressEvent::CheckingContextWindow {
+                        current_tokens: context_tokens,
+                        target_window,
+                    }),
+                );
                 if context_tokens <= target_window {
                     break;
                 }
@@ -210,21 +270,50 @@ async fn execute_selection(
                         args.max_pre_compactions
                     );
                 }
+                emit_progress(
+                    progress.as_ref(),
+                    OperationProgressEvent::Smart(SmartProgressEvent::RunningCompaction {
+                        attempt: compactions_run + 1,
+                        max_attempts: args.max_pre_compactions,
+                    }),
+                );
                 run_command(Command::Compact(CompactArgs {
                     target: args.target.clone(),
                     timeout_secs: args.timeout_secs,
                 }))
                 .await?;
                 compactions_run += 1;
+                emit_progress(
+                    progress.as_ref(),
+                    OperationProgressEvent::Smart(
+                        SmartProgressEvent::ReloadingSummaryAfterCompaction {
+                            attempt: compactions_run,
+                        },
+                    ),
+                );
                 summary =
                     build_session_summary(&source_config, summary.rollout_path.as_path()).await?;
             }
         }
 
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Smart(SmartProgressEvent::WritingProfile {
+                profile: target_profile.clone(),
+            }),
+        );
         write_profile_from_config(target_profile.as_str(), &selection.target_config).await?;
         if selection.should_repair_resume_state(&current_model, summary.latest_model_context_window)
             && let Some(target_window) = selection.target_context_window
         {
+            emit_progress(
+                progress.as_ref(),
+                OperationProgressEvent::Smart(SmartProgressEvent::RepairingResumeState {
+                    provider: selection.provider.clone(),
+                    model: selection.model.clone(),
+                    context_window: Some(target_window),
+                }),
+            );
             run_command(Command::RepairResumeState(RepairResumeStateArgs {
                 target: args.target.clone(),
                 context_window: Some(target_window),
@@ -238,6 +327,12 @@ async fn execute_selection(
             .await?
             .meta
             .id;
+        emit_progress(
+            progress.as_ref(),
+            OperationProgressEvent::Smart(SmartProgressEvent::Completed {
+                thread_id: Some(thread_id.to_string()),
+            }),
+        );
         return Ok(SmartExecutionOutput {
             title: "Smart Switch Completed".to_string(),
             lines: vec![
@@ -260,6 +355,10 @@ async fn execute_selection(
             preferred_rollout_path: Some(summary.rollout_path.clone()),
         });
     }
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Smart(SmartProgressEvent::SnapshottingThreadList),
+    );
     let before_thread_ids = {
         let config = source_config.clone();
         let items = RolloutRecorder::list_threads(
@@ -279,6 +378,10 @@ async fn execute_selection(
             .filter_map(|item| item.thread_id.map(|id| id.to_string()))
             .collect::<std::collections::HashSet<_>>()
     };
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Smart(SmartProgressEvent::RunningMigration),
+    );
     run_command(Command::Migrate(MigrateArgs {
         target: target_args.clone(),
         model: Some(selection.model.clone()),
@@ -295,6 +398,10 @@ async fn execute_selection(
         timeout_secs: args.timeout_secs,
     }))
     .await?;
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Smart(SmartProgressEvent::RefreshingThreadList),
+    );
     let config =
         load_runtime_config(target_args.config_profile, None, None, None, None, None).await?;
     let items = RolloutRecorder::list_threads(
@@ -317,6 +424,12 @@ async fn execute_selection(
         .as_ref()
         .and_then(|item| item.thread_id.as_ref().map(ToString::to_string));
     let preferred_rollout_path = successor.map(|item| item.path);
+    emit_progress(
+        progress.as_ref(),
+        OperationProgressEvent::Smart(SmartProgressEvent::Completed {
+            thread_id: preferred_thread_id.clone(),
+        }),
+    );
     Ok(SmartExecutionOutput {
         title: "Smart Switch Completed".to_string(),
         lines: vec![
@@ -376,6 +489,38 @@ impl SmartSelection {
         self.model != current_model
             || (self.target_context_window.is_some()
                 && self.target_context_window != current_window)
+    }
+}
+
+fn planned_strategy(
+    summary: &crate::types::SessionSummary,
+    current_provider: &str,
+    current_model: &str,
+    selection: &SmartSelection,
+) -> SmartStrategyKind {
+    let current_context_tokens = summary.latest_context_tokens;
+    let current_context_window = summary.latest_model_context_window;
+    let needs_compaction = selection
+        .target_context_window
+        .zip(current_context_tokens)
+        .is_some_and(|(target_window, context_tokens)| context_tokens > target_window);
+    let needs_repair_resume_state = selection
+        .should_repair_resume_state(current_model, current_context_window)
+        && selection.target_context_window.is_some();
+    let same_provider = selection.provider == current_provider;
+    match selection.execution_mode {
+        SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic => {
+            SmartStrategyKind::DistillSuccessor
+        }
+        SmartExecutionMode::Direct => {
+            match (same_provider, needs_compaction, needs_repair_resume_state) {
+                (true, false, false) => SmartStrategyKind::SameThreadProfileOnly,
+                (true, false, true) => SmartStrategyKind::SameThreadRepair,
+                (true, true, _) => SmartStrategyKind::SameThreadRepairAfterCompaction,
+                (false, false, _) => SmartStrategyKind::CrossProviderMigrate,
+                (false, true, _) => SmartStrategyKind::CrossProviderMigrateAfterCompaction,
+            }
+        }
     }
 }
 
