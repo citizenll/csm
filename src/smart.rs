@@ -166,13 +166,7 @@ async fn execute_selection(
         .clone()
         .or(source_config.model.clone())
         .unwrap_or_default();
-    let target_profile = args.write_profile.clone().unwrap_or_else(|| {
-        default_smart_profile_name(
-            selection.provider.as_str(),
-            selection.model.as_str(),
-            selection.target_context_window,
-        )
-    });
+    let target_profile = args.write_profile.clone();
     let strategy = planned_strategy(
         &summary,
         current_provider.as_str(),
@@ -221,7 +215,7 @@ async fn execute_selection(
                 },
                 reasoning_effort: None,
                 thread_name: summary.thread_name.clone(),
-                write_profile: Some(target_profile.clone()),
+                write_profile: target_profile.clone(),
                 archive_source: args.archive_source,
                 preview_only: false,
                 json: false,
@@ -296,13 +290,15 @@ async fn execute_selection(
             }
         }
 
-        emit_progress(
-            progress.as_ref(),
-            OperationProgressEvent::Smart(SmartProgressEvent::WritingProfile {
-                profile: target_profile.clone(),
-            }),
-        );
-        write_profile_from_config(target_profile.as_str(), &selection.target_config).await?;
+        if let Some(target_profile) = target_profile.as_deref() {
+            emit_progress(
+                progress.as_ref(),
+                OperationProgressEvent::Smart(SmartProgressEvent::WritingProfile {
+                    profile: target_profile.to_string(),
+                }),
+            );
+            write_profile_from_config(target_profile, &selection.target_config).await?;
+        }
         if selection.should_repair_resume_state(&current_model, summary.latest_model_context_window)
             && let Some(target_window) = selection.target_context_window
         {
@@ -345,10 +341,10 @@ async fn execute_selection(
                         .target_context_window
                         .map_or_else(String::new, |value| value.to_string())
                 ),
-                format!("profile: {}", target_profile),
+                format!("write_profile: {}", target_profile.as_deref().unwrap_or("")),
                 format!(
                     "resume_command: {}",
-                    render_profiled_resume_command(Some(target_profile.as_str()), thread_id)
+                    render_profiled_resume_command(target_profile.as_deref(), thread_id)
                 ),
             ],
             preferred_thread_id: Some(thread_id.to_string()),
@@ -388,7 +384,7 @@ async fn execute_selection(
         provider: Some(selection.provider.clone()),
         context_window: selection.target_context_window,
         auto_compact_token_limit: selection.target_auto_compact_token_limit,
-        write_profile: Some(target_profile.clone()),
+        write_profile: target_profile.clone(),
         thread_name: summary.thread_name.clone(),
         persist_extended_history: false,
         nth_user_message: None,
@@ -442,7 +438,7 @@ async fn execute_selection(
                     .target_context_window
                     .map_or_else(String::new, |value| value.to_string())
             ),
-            format!("profile: {}", target_profile),
+            format!("write_profile: {}", target_profile.as_deref().unwrap_or("")),
             format!("archive_source: {}", args.archive_source),
         ],
         preferred_thread_id,
@@ -537,7 +533,7 @@ enum SmartStrategy {
 #[derive(Debug, Clone)]
 struct SmartPreview {
     selection: SmartSelection,
-    target_profile: String,
+    target_profile: Option<String>,
     strategy: SmartStrategy,
     current_context_tokens: Option<i64>,
     current_context_window: Option<i64>,
@@ -867,13 +863,7 @@ fn plan_preview(
     args: &SmartArgs,
     selection: SmartSelection,
 ) -> SmartPreview {
-    let target_profile = args.write_profile.clone().unwrap_or_else(|| {
-        default_smart_profile_name(
-            selection.provider.as_str(),
-            selection.model.as_str(),
-            selection.target_context_window,
-        )
-    });
+    let target_profile = args.write_profile.clone();
     let current_context_tokens = summary.latest_context_tokens;
     let current_context_window = summary.latest_model_context_window;
     let execution_mode = selection.execution_mode;
@@ -938,30 +928,6 @@ fn plan_preview(
         blocked_reason,
         max_pre_compactions: args.max_pre_compactions,
     }
-}
-
-fn default_smart_profile_name(provider: &str, model: &str, context_window: Option<i64>) -> String {
-    let provider = sanitize_profile_component(provider);
-    let model = sanitize_profile_component(model);
-    match context_window {
-        Some(context_window) => format!("smart-{provider}-{model}-{context_window}"),
-        None => format!("smart-{provider}-{model}"),
-    }
-}
-
-fn sanitize_profile_component(value: &str) -> String {
-    let mut out = String::new();
-    let mut previous_dash = false;
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            out.push(character);
-            previous_dash = false;
-        } else if !previous_dash {
-            out.push('-');
-            previous_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
 }
 
 fn strategy_label(strategy: SmartStrategy) -> &'static str {
@@ -1324,10 +1290,16 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                 }),
                 Line::from(match (picker.language, preview) {
                     (PickerLanguage::English, Some(preview)) => {
-                        format!("Write profile: {}", preview.target_profile)
+                        match preview.target_profile.as_deref() {
+                            Some(profile) => format!("Write profile: {profile}"),
+                            None => "Write profile: none (default)".to_string(),
+                        }
                     }
                     (PickerLanguage::Chinese, Some(preview)) => {
-                        format!("写入 profile：{}", preview.target_profile)
+                        match preview.target_profile.as_deref() {
+                            Some(profile) => format!("写入 profile：{profile}"),
+                            None => "写入 profile：不写入（默认）".to_string(),
+                        }
                     }
                     (PickerLanguage::English, None) => "Write profile: ".to_string(),
                     (PickerLanguage::Chinese, None) => "写入 profile：".to_string(),
@@ -1470,7 +1442,6 @@ mod tests {
     use super::SmartSelection;
     use super::SmartStrategy;
     use super::collect_provider_choices;
-    use super::default_smart_profile_name;
     use super::plan_preview;
     use crate::cli::SmartArgs;
     use crate::cli::TargetArgs;
@@ -1513,18 +1484,6 @@ mod tests {
         assert_eq!(providers[0], "openai");
         assert!(providers.contains(&"yunyi".to_string()));
         assert!(providers.contains(&"openrouter".to_string()));
-    }
-
-    #[test]
-    fn default_smart_profile_name_sanitizes_components() {
-        assert_eq!(
-            default_smart_profile_name("yunyi", "gpt-5.2-codex", Some(258400)),
-            "smart-yunyi-gpt-5-2-codex-258400"
-        );
-        assert_eq!(
-            default_smart_profile_name("model_providers.yunyi", "gpt/5.4", None),
-            "smart-model-providers-yunyi-gpt-5-4"
-        );
     }
 
     #[tokio::test]
