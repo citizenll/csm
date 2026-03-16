@@ -1,3 +1,4 @@
+use crate::profile_cleanup::cleanup_generated_profiles;
 use crate::runtime::load_runtime_config;
 use crate::runtime::write_profile_from_config;
 use crate::summary::build_session_summary;
@@ -251,7 +252,7 @@ pub(crate) async fn fork_rollout_path(request: ForkRequest) -> Result<ForkOutcom
     let source_summary = build_session_summary(&base_config, source_rollout_path.as_path()).await?;
     let source_meta = read_session_meta_line(source_rollout_path.as_path()).await?;
     let target_config = load_runtime_config(
-        source_profile,
+        source_profile.clone(),
         Some(source_summary.session_cwd.clone()),
         model.or(source_summary.latest_model.clone()),
         provider.or(source_summary.session_provider.clone()),
@@ -311,6 +312,11 @@ pub(crate) async fn fork_rollout_path(request: ForkRequest) -> Result<ForkOutcom
     rename_result?;
     profile_result?;
     shutdown_result?;
+    let _ = cleanup_generated_profiles(
+        target_config.codex_home.as_path(),
+        &[source_profile.as_deref(), write_profile.as_deref()],
+    )
+    .await;
 
     Ok(ForkOutcome {
         thread_id: new_thread.thread_id,

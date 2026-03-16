@@ -6,6 +6,7 @@ use crate::operations::reconcile_rollout_path;
 use crate::operations::resolve_new_rollout_path;
 use crate::operations::shutdown_thread;
 use crate::preview;
+use crate::profile_cleanup::cleanup_generated_profiles;
 use crate::progress::DistillProgressEvent;
 use crate::progress::OperationProgressEvent;
 use crate::progress::ProgressSender;
@@ -295,6 +296,15 @@ pub(crate) async fn execute_with_progress(
         )
         .await?;
     }
+
+    let _ = cleanup_generated_profiles(
+        runtime_config.codex_home.as_path(),
+        &[
+            args.target.config_profile.as_deref(),
+            args.write_profile.as_deref(),
+        ],
+    )
+    .await;
 
     let output = DistillOutput {
         successor_thread_id: Some(new_thread.thread_id.to_string()),

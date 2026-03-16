@@ -8,6 +8,7 @@ mod commands;
 mod distill;
 mod operations;
 mod preview;
+mod profile_cleanup;
 mod progress;
 mod rollout_edit;
 mod runtime;

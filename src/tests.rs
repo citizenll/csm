@@ -172,27 +172,6 @@ fn cli_parses_first_token_preview_command() {
 }
 
 #[test]
-fn cli_parses_clean_generated_profiles_command() {
-    let cli = crate::Cli::try_parse_from([
-        "codex-session-manager",
-        "clean-generated-profiles",
-        "--prefix",
-        "smart-",
-        "--dry-run",
-        "--json",
-    ])
-    .expect("parse cli");
-
-    let Some(crate::cli::Command::CleanGeneratedProfiles(args)) = cli.command else {
-        panic!("expected clean-generated-profiles command");
-    };
-
-    assert_eq!(args.prefixes, vec!["smart-".to_string()]);
-    assert!(args.dry_run);
-    assert!(args.json);
-}
-
-#[test]
 fn rewrite_rollout_meta_contents_updates_first_session_meta_line() {
     let thread_id =
         ThreadId::from_string("019cd66f-f4ea-7022-802b-7007c11cea97").expect("thread id");

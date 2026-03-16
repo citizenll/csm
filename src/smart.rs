@@ -5,6 +5,7 @@ use crate::cli::MigrateArgs;
 use crate::cli::RepairResumeStateArgs;
 use crate::cli::SmartArgs;
 use crate::distill;
+use crate::profile_cleanup::cleanup_generated_profiles;
 use crate::progress::OperationProgressEvent;
 use crate::progress::ProgressSender;
 use crate::progress::SmartProgressEvent;
@@ -323,6 +324,14 @@ async fn execute_selection(
             .await?
             .meta
             .id;
+        let _ = cleanup_generated_profiles(
+            source_config.codex_home.as_path(),
+            &[
+                args.target.config_profile.as_deref(),
+                args.write_profile.as_deref(),
+            ],
+        )
+        .await;
         emit_progress(
             progress.as_ref(),
             OperationProgressEvent::Smart(SmartProgressEvent::Completed {
