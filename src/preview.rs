@@ -7,8 +7,10 @@ use crate::types::SessionSummary;
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::RolloutRecorder;
+use codex_core::build_responses_tool_schema_preview;
 use codex_core::features::Feature;
 use codex_core::parse_turn_item;
+use codex_core::read_session_meta_line;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -16,6 +18,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnContextItem;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -38,6 +41,10 @@ pub(crate) async fn execute(args: FirstTokenPreviewArgs) -> Result<FirstTokenPre
     let summary = build_session_summary(&resolved.config, resolved.rollout_path.as_path()).await?;
     let runtime_config =
         load_session_runtime_config(args.target.config_profile.clone(), &summary).await?;
+    let session_source = read_session_meta_line(resolved.rollout_path.as_path())
+        .await?
+        .meta
+        .source;
     let history = RolloutRecorder::get_rollout_history(resolved.rollout_path.as_path())
         .await
         .with_context(|| {
@@ -50,6 +57,7 @@ pub(crate) async fn execute(args: FirstTokenPreviewArgs) -> Result<FirstTokenPre
     let preview = build_prompt_preview_snapshot(
         &summary,
         &runtime_config,
+        session_source,
         &history,
         rollout_items.as_slice(),
         args.input.as_deref(),
@@ -67,6 +75,10 @@ pub(crate) async fn build_prompt_preview_for_distill(
     let summary = build_session_summary(&resolved.config, resolved.rollout_path.as_path()).await?;
     let runtime_config =
         load_session_runtime_config(target.config_profile.clone(), &summary).await?;
+    let session_source = read_session_meta_line(resolved.rollout_path.as_path())
+        .await?
+        .meta
+        .source;
     let history = RolloutRecorder::get_rollout_history(resolved.rollout_path.as_path())
         .await
         .with_context(|| {
@@ -79,6 +91,7 @@ pub(crate) async fn build_prompt_preview_for_distill(
     build_prompt_preview_snapshot(
         &summary,
         &runtime_config,
+        session_source,
         &history,
         rollout_items.as_slice(),
         None,
@@ -92,6 +105,9 @@ pub(crate) struct PromptPreviewSnapshot {
     pub(crate) history_items_count: usize,
     pub(crate) history_tokens_estimate: usize,
     pub(crate) base_instructions_tokens_estimate: usize,
+    pub(crate) tool_schema_tokens_estimate: usize,
+    pub(crate) tool_count: usize,
+    pub(crate) tool_names: Vec<String>,
     pub(crate) previous_turn_model: Option<String>,
     pub(crate) reference_context_item: Option<TurnContextItem>,
     pub(crate) context_strategy: NextTurnContextStrategy,
@@ -149,8 +165,11 @@ pub(crate) struct FirstTokenPreviewOutput {
     reconstructed_history_items: usize,
     reconstructed_history_tokens_estimate: usize,
     base_instructions_tokens_estimate: usize,
+    tool_schema_tokens_estimate: usize,
+    tool_count: usize,
+    tool_names: Vec<String>,
     next_turn_extras_tokens_estimate: usize,
-    estimated_full_request_without_tools: usize,
+    estimated_full_request_without_live_tools: usize,
     previous_turn_model: Option<String>,
     reference_context_item_present: bool,
     next_turn_context_strategy: NextTurnContextStrategy,
@@ -183,18 +202,32 @@ impl FirstTokenPreviewOutput {
             reconstructed_history_items: snapshot.history_items_count,
             reconstructed_history_tokens_estimate: snapshot.history_tokens_estimate,
             base_instructions_tokens_estimate: snapshot.base_instructions_tokens_estimate,
+            tool_schema_tokens_estimate: snapshot.tool_schema_tokens_estimate,
+            tool_count: snapshot.tool_count,
+            tool_names: snapshot.tool_names,
             next_turn_extras_tokens_estimate: snapshot
                 .prompt_sections
                 .iter()
-                .filter(|section| section.kind != "reconstructed_history")
+                .filter(|section| {
+                    !matches!(
+                        section.kind.as_str(),
+                        "reconstructed_history" | "base_instructions" | "tool_schema"
+                    )
+                })
                 .map(|section| section.estimated_tokens)
                 .sum(),
-            estimated_full_request_without_tools: snapshot.history_tokens_estimate
+            estimated_full_request_without_live_tools: snapshot.history_tokens_estimate
                 + snapshot.base_instructions_tokens_estimate
+                + snapshot.tool_schema_tokens_estimate
                 + snapshot
                     .prompt_sections
                     .iter()
-                    .filter(|section| section.kind != "reconstructed_history")
+                    .filter(|section| {
+                        !matches!(
+                            section.kind.as_str(),
+                            "reconstructed_history" | "base_instructions" | "tool_schema"
+                        )
+                    })
                     .map(|section| section.estimated_tokens)
                     .sum::<usize>(),
             previous_turn_model: snapshot.previous_turn_model,
@@ -257,14 +290,19 @@ pub(crate) fn render_output_lines(output: &FirstTokenPreviewOutput) -> Vec<Strin
             output.base_instructions_tokens_estimate
         ),
         format!(
+            "tool_schema_tokens_estimate: {}",
+            output.tool_schema_tokens_estimate
+        ),
+        format!("tool_count: {}", output.tool_count),
+        format!(
             "next_turn_extras_tokens_estimate: {}",
             output.next_turn_extras_tokens_estimate
         ),
         format!(
-            "estimated_full_request_without_tools: {}",
-            output.estimated_full_request_without_tools
+            "estimated_full_request_without_live_tools: {}",
+            output.estimated_full_request_without_live_tools
         ),
-        "estimate_scope: includes reconstructed history + base instructions + next-turn extras, but still excludes tool schema payloads".to_string(),
+        "estimate_scope: includes reconstructed history + base instructions + built-in/dynamic tool schema + next-turn extras, but still excludes live-discovered MCP/app/discoverable tools".to_string(),
     ];
     if let Some(summary) = output.latest_compaction_summary.as_deref() {
         lines.push(String::new());
@@ -336,6 +374,21 @@ pub(crate) fn render_output_lines(output: &FirstTokenPreviewOutput) -> Vec<Strin
     }
     if !output.history_tail.is_empty() {
         lines.push(String::new());
+    }
+    if output.tool_count > 0 {
+        lines.push("tool_names:".to_string());
+        lines.extend(
+            output
+                .tool_names
+                .iter()
+                .take(24)
+                .map(|tool_name| format!("- {tool_name}")),
+        );
+        if output.tool_names.len() > 24 {
+            lines.push(format!("- ... {} more", output.tool_names.len() - 24));
+        }
+    }
+    if !output.history_tail.is_empty() {
         lines.push("history_tail:".to_string());
         lines.extend(output.history_tail.iter().map(|item| {
             format!(
@@ -381,6 +434,7 @@ struct ActiveReplaySegment<'a> {
 async fn build_prompt_preview_snapshot(
     summary: &SessionSummary,
     runtime_config: &codex_core::config::Config,
+    session_source: SessionSource,
     initial_history: &InitialHistory,
     rollout_items: &[RolloutItem],
     next_user_input: Option<&str>,
@@ -414,6 +468,13 @@ async fn build_prompt_preview_snapshot(
         .is_some_and(|text| !text.trim().is_empty());
     let (memory_prompt_available, memory_summary_tokens_estimate) =
         detect_memory_prompt(runtime_config).await?;
+    let dynamic_tools = initial_history.get_dynamic_tools().unwrap_or_default();
+    let tool_schema_preview = build_responses_tool_schema_preview(
+        runtime_config,
+        session_source,
+        dynamic_tools.as_slice(),
+    )
+    .await?;
     let mut prompt_sections = vec![PromptSectionPreview {
         kind: "reconstructed_history".to_string(),
         description: format!(
@@ -429,6 +490,18 @@ async fn build_prompt_preview_snapshot(
             estimated_tokens: approx_token_count(base_instructions.as_str()),
         });
     }
+    prompt_sections.push(PromptSectionPreview {
+        kind: "tool_schema".to_string(),
+        description: format!(
+            "built-in and dynamic tool schemas serialized for the next request ({} tools)",
+            tool_schema_preview.tool_names.len()
+        ),
+        estimated_tokens: approx_token_count(
+            serde_json::to_string(&tool_schema_preview.tools_json)
+                .unwrap_or_default()
+                .as_str(),
+        ),
+    });
     let context_strategy = if reconstruction.reference_context_item.is_none() {
         prompt_sections.push(PromptSectionPreview {
             kind: "initial_context".to_string(),
@@ -513,6 +586,13 @@ async fn build_prompt_preview_snapshot(
         history_items_count: reconstruction.history.len(),
         history_tokens_estimate: estimate_response_items_tokens(reconstruction.history.as_slice()),
         base_instructions_tokens_estimate: approx_token_count(base_instructions.as_str()),
+        tool_schema_tokens_estimate: approx_token_count(
+            serde_json::to_string(&tool_schema_preview.tools_json)
+                .unwrap_or_default()
+                .as_str(),
+        ),
+        tool_count: tool_schema_preview.tool_names.len(),
+        tool_names: tool_schema_preview.tool_names,
         previous_turn_model: reconstruction
             .previous_turn_settings
             .map(|settings| settings.model),

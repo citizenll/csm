@@ -1008,6 +1008,10 @@ fn prompt_reconstruction_notes(prompt_preview: &preview::PromptPreviewSnapshot) 
             "- Reconstructed history tokens estimate: {}",
             prompt_preview.history_tokens_estimate
         ),
+        format!(
+            "- Built-in and dynamic tool schema tokens estimate: {}",
+            prompt_preview.tool_schema_tokens_estimate
+        ),
     ];
     if let Some(previous_turn_model) = prompt_preview.previous_turn_model.as_deref() {
         notes.push(format!(
@@ -1057,6 +1061,10 @@ fn prompt_reconstruction_notes(prompt_preview: &preview::PromptPreviewSnapshot) 
     notes.push(format!(
         "- Memory prompt available: {}",
         prompt_preview.memory_prompt_available
+    ));
+    notes.push(format!(
+        "- Built-in and dynamic tool count: {}",
+        prompt_preview.tool_count
     ));
     notes
 }
@@ -1206,6 +1214,9 @@ mod tests {
             history_items_count: reconstructed_items.len(),
             history_tokens_estimate: 100,
             base_instructions_tokens_estimate: 0,
+            tool_schema_tokens_estimate: 0,
+            tool_count: 0,
+            tool_names: Vec::new(),
             previous_turn_model: Some("gpt-5.4".to_string()),
             reference_context_item: None,
             context_strategy: NextTurnContextStrategy::FullInitialContext {

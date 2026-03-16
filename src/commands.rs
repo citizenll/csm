@@ -1,3 +1,4 @@
+use crate::cli::CleanGeneratedProfilesArgs;
 use crate::cli::Command;
 use crate::cli::CompactArgs;
 use crate::cli::ForkArgs;
@@ -58,9 +59,83 @@ pub(crate) async fn run(command: Command) -> Result<()> {
         Command::Rollback(args) => rollback_session(args).await,
         Command::Migrate(args) => migrate_session(args).await,
         Command::Smart(args) => smart::run(args).await,
+        Command::CleanGeneratedProfiles(args) => clean_generated_profiles(args).await,
         Command::FirstTokenPreview(args) => preview::run(args).await,
         Command::Distill(args) => distill::run(args).await,
     }
+}
+
+#[derive(serde::Serialize)]
+struct CleanGeneratedProfilesOutput {
+    codex_home: std::path::PathBuf,
+    config_path: std::path::PathBuf,
+    removed_profiles: Vec<String>,
+    dry_run: bool,
+}
+
+async fn clean_generated_profiles(args: CleanGeneratedProfilesArgs) -> Result<()> {
+    let codex_home =
+        codex_core::config::find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let config_path = codex_home.join(codex_core::config::CONFIG_TOML_FILE);
+    let config = if config_path.exists() {
+        let contents = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        toml::from_str::<codex_core::config::ConfigToml>(&contents)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?
+    } else {
+        codex_core::config::ConfigToml::default()
+    };
+
+    let removed_profiles = generated_profile_names(&config, args.prefixes.as_slice());
+    let output = CleanGeneratedProfilesOutput {
+        codex_home: codex_home.clone(),
+        config_path: config_path.clone(),
+        removed_profiles: removed_profiles.clone(),
+        dry_run: args.dry_run,
+    };
+
+    if !args.dry_run && !removed_profiles.is_empty() {
+        let mut edits = removed_profiles
+            .iter()
+            .map(|profile| codex_core::config::edit::ConfigEdit::ClearPath {
+                segments: vec!["profiles".to_string(), profile.clone()],
+            })
+            .collect::<Vec<_>>();
+        if config.profiles.len() == removed_profiles.len() {
+            edits.push(codex_core::config::edit::ConfigEdit::ClearPath {
+                segments: vec!["profiles".to_string()],
+            });
+        }
+        codex_core::config::edit::apply(&codex_home, None, edits).await?;
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    println!("codex_home: {}", output.codex_home.display());
+    println!("config_path: {}", output.config_path.display());
+    println!("dry_run: {}", output.dry_run);
+    println!("removed_profiles_count: {}", output.removed_profiles.len());
+    for profile in output.removed_profiles {
+        println!("removed_profile: {profile}");
+    }
+    Ok(())
+}
+
+fn generated_profile_names(
+    config: &codex_core::config::ConfigToml,
+    prefixes: &[String],
+) -> Vec<String> {
+    let mut names = config
+        .profiles
+        .keys()
+        .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 async fn show_session(args: ShowArgs) -> Result<()> {

@@ -61,6 +61,9 @@ pub(crate) enum Command {
     Migrate(MigrateArgs),
     /// Interactive smart provider/model switch workflow.
     Smart(SmartArgs),
+    /// Remove generated migration/smart profiles from config.toml.
+    #[command(name = "clean-generated-profiles", alias = "clean-profiles")]
+    CleanGeneratedProfiles(CleanGeneratedProfilesArgs),
     /// Preview the next model-visible prompt built when this thread resumes.
     #[command(name = "first-token-preview", alias = "preview")]
     FirstTokenPreview(FirstTokenPreviewArgs),
@@ -343,6 +346,21 @@ pub(crate) struct FirstTokenPreviewArgs {
     /// Optional next user input to include at the end of the simulated prompt.
     #[arg(long)]
     pub(crate) input: Option<String>,
+
+    /// Emit structured JSON instead of plain text output.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CleanGeneratedProfilesArgs {
+    /// Prefix used to identify generated profiles. Can be repeated.
+    #[arg(long = "prefix", default_values_t = vec!["smart-".to_string()])]
+    pub(crate) prefixes: Vec<String>,
+
+    /// Show what would be removed without changing config.toml.
+    #[arg(long, default_value_t = false)]
+    pub(crate) dry_run: bool,
 
     /// Emit structured JSON instead of plain text output.
     #[arg(long, default_value_t = false)]
