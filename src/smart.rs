@@ -765,11 +765,6 @@ fn collect_provider_choices(config: &ConfigToml, current_provider: &str) -> Vec<
     for provider in config.model_providers.keys() {
         providers.insert(provider.clone());
     }
-    for profile in config.profiles.values() {
-        if let Some(provider) = profile.model_provider.clone() {
-            providers.insert(provider);
-        }
-    }
 
     let mut values = providers.into_iter().collect::<Vec<_>>();
     values.sort();
@@ -1449,7 +1444,6 @@ mod tests {
     use codex_core::ModelProviderInfo;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigToml;
-    use codex_core::config::profile::ConfigProfile;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -1472,18 +1466,10 @@ mod tests {
             "yunyi".to_string(),
             ModelProviderInfo::create_openai_provider(),
         );
-        config.profiles.insert(
-            "team".to_string(),
-            ConfigProfile {
-                model_provider: Some("openrouter".to_string()),
-                ..Default::default()
-            },
-        );
-
         let providers = collect_provider_choices(&config, "openai");
         assert_eq!(providers[0], "openai");
         assert!(providers.contains(&"yunyi".to_string()));
-        assert!(providers.contains(&"openrouter".to_string()));
+        assert!(!providers.contains(&"openrouter".to_string()));
     }
 
     #[tokio::test]
