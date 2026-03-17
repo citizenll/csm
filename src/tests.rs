@@ -127,6 +127,31 @@ fn cli_parses_smart_command() {
 
     assert_eq!(args.target.target, "thread-123");
     assert!(args.archive_source);
+    assert_eq!(
+        args.distill_compression_level,
+        crate::cli::DistillCompressionLevel::Balanced
+    );
+}
+
+#[test]
+fn cli_parses_smart_distill_compression_level() {
+    let cli = crate::Cli::try_parse_from([
+        "codex-session-manager",
+        "smart",
+        "thread-123",
+        "--distill-compression-level",
+        "lossless",
+    ])
+    .expect("parse cli");
+
+    let Some(crate::cli::Command::Smart(args)) = cli.command else {
+        panic!("expected smart command");
+    };
+
+    assert_eq!(
+        args.distill_compression_level,
+        crate::cli::DistillCompressionLevel::Lossless
+    );
 }
 
 #[test]
@@ -148,6 +173,31 @@ fn cli_parses_distill_command() {
     assert_eq!(args.target.target, "thread-123");
     assert!(args.preview_only);
     assert_eq!(args.recent_turns, 6);
+    assert_eq!(
+        args.compression_level,
+        crate::cli::DistillCompressionLevel::Balanced
+    );
+}
+
+#[test]
+fn cli_parses_distill_compression_level() {
+    let cli = crate::Cli::try_parse_from([
+        "codex-session-manager",
+        "distill",
+        "thread-123",
+        "--compression-level",
+        "aggressive",
+    ])
+    .expect("parse cli");
+
+    let Some(crate::cli::Command::Distill(args)) = cli.command else {
+        panic!("expected distill command");
+    };
+
+    assert_eq!(
+        args.compression_level,
+        crate::cli::DistillCompressionLevel::Aggressive
+    );
 }
 
 #[test]

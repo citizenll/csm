@@ -21,7 +21,7 @@ Conversation refusing to load? CSM can help you rebuild and repair the session s
 2. **🚚 Painless Model/Provider Switching (Migration)**
 Want to seamlessly move your current chat to a different AI model (like one with a larger context window)? CSM offers a guided "moving service" so you don't lose your place.
 3. **🧳 Lightweight Successor Sessions (Distill)**
-When one long-lived project thread becomes expensive to reopen, CSM can distill its effective history into a lighter successor session with a much smaller cold-start footprint.
+When one long-lived project thread becomes expensive to reopen, CSM can distill its effective history into a lighter successor session with a much smaller cold-start footprint. Distill supports three compression levels: `lossless`, `balanced` (default), and `aggressive`.
 4. **🧪 First-Request Preview**
 CSM can reconstruct the next request Codex will actually send on resume, including rebuilt history, base instructions, and built-in tool schema estimates, so you can understand cold-start cost before opening a heavy thread.
 5. **🔍 Chat History X-Ray (Inspection)**
@@ -35,7 +35,7 @@ Every operation in CSM strictly follows native Codex rules. It will never blindl
 
 If you don't want to memorize complex commands, you only need to remember one: `smart`.
 
-**The `smart` mode is the heart of CSM.** Just point it to a conversation, and it will pop up a guided menu letting you pick a new provider or model. It then automatically figures out the best path forward: whether to repair your current thread in place or smoothly migrate your history to a new one.
+**The `smart` mode is the heart of CSM.** Just point it to a conversation, and it will pop up a guided menu letting you pick a new provider or model. It then automatically figures out the best path forward: whether to repair your current thread in place, smoothly migrate your history to a new one, or distill a lighter successor with a selectable compression level.
 
 By default, `smart` and related flows do **not** write new profiles into `config.toml`. Profile writes are opt-in only when you explicitly pass `--write-profile`.
 
@@ -52,6 +52,11 @@ the source thread's effective history:
 ```powershell
 cargo run -- distill <thread-id-or-path>
 ```
+
+Compression guidance:
+- `lossless`: keeps much more of the thread's corrections, conventions, and active context
+- `balanced`: the new default; cuts weight while still preserving implementation-safe detail
+- `aggressive`: closest to the old ultra-compact behavior
 
 ---
 
@@ -87,10 +92,11 @@ For those who prefer the command line, CSM offers a rich set of direct commands:
 
 ### 🟡 Advanced & Migration
 
+* **Smart switch wizard**: `cargo run -- smart <ID>` (Pick provider, model, execution mode, and distill compression level from the interactive picker)
 * **Branch a thread (Fork)**: `cargo run -- fork <ID> --provider openrouter --model gpt-5` (Creates a new thread from the current one using a new model)
 * **Slim down history (Compact)**: `cargo run -- compact <ID>` (Compresses chat history to free up context space)
 * **Manual Migration**: `cargo run -- migrate <ID> --provider ...` (Designed for moving from large-window models to smaller ones; automatically compacts and forks)
-* **Create a distilled successor**: `cargo run -- distill <ID>` (Builds a deterministic handoff brief and starts a lighter successor session)
+* **Create a distilled successor**: `cargo run -- distill <ID> --compression-level balanced` (Builds a deterministic handoff brief and starts a lighter successor session)
 
 ### 🔴 Emergency Repair
 
@@ -108,7 +114,3 @@ While CSM provides a user-friendly high-level wrapper, it isn't "magic." It **do
 * **Native Semantics**: It intentionally reuses Codex's internal Rust core logic (e.g., `ThreadManager::fork_thread`, `Op::Compact`).
 * **Architecture**: Core operations live in `src/operations.rs` (native actions) and `src/rollout_edit.rs` (JSONL surgery), orchestrated safely by `src/commands.rs`.
 * **Prompt Reconstruction**: `first-token-preview` and prompt-based `distill` rebuild the model-visible resume context from rollout history before estimating or generating successor handoff briefs.
-
----
-
-Would you like me to help you draft a short release or commit message to go along with this new README update?

@@ -1,6 +1,7 @@
 use crate::cli::Command;
 use crate::cli::CompactArgs;
 use crate::cli::DistillArgs;
+use crate::cli::DistillCompressionLevel;
 use crate::cli::MigrateArgs;
 use crate::cli::RepairResumeStateArgs;
 use crate::cli::SmartArgs;
@@ -198,6 +199,7 @@ async fn execute_selection(
                     }
                     SmartExecutionMode::Direct => unreachable!(),
                 },
+                compression_level: selection.distill_compression_level,
             }),
         );
         let output = distill::execute_with_progress(
@@ -214,6 +216,7 @@ async fn execute_selection(
                     }
                     SmartExecutionMode::Direct => unreachable!(),
                 },
+                compression_level: selection.distill_compression_level,
                 reasoning_effort: None,
                 thread_name: summary.thread_name.clone(),
                 write_profile: target_profile.clone(),
@@ -484,6 +487,7 @@ pub(crate) struct SmartSelection {
     provider: String,
     model: String,
     execution_mode: SmartExecutionMode,
+    distill_compression_level: DistillCompressionLevel,
     target_config: Config,
     target_context_window: Option<i64>,
     target_auto_compact_token_limit: Option<i64>,
@@ -564,6 +568,7 @@ struct SmartPicker {
     models: Vec<ModelPreset>,
     model_index: usize,
     execution_mode_index: usize,
+    compression_level_index: usize,
     step: SmartStep,
     preview: Option<SmartPreview>,
 }
@@ -573,6 +578,7 @@ enum SmartStep {
     Provider,
     Model,
     Mode,
+    Compression,
     Confirm,
 }
 
@@ -589,6 +595,23 @@ impl SmartExecutionMode {
             SmartExecutionMode::Direct,
             SmartExecutionMode::DistillCodex,
             SmartExecutionMode::DistillDeterministic,
+        ]
+    }
+
+    fn uses_distill(self) -> bool {
+        matches!(
+            self,
+            SmartExecutionMode::DistillCodex | SmartExecutionMode::DistillDeterministic
+        )
+    }
+}
+
+impl DistillCompressionLevel {
+    fn all() -> [DistillCompressionLevel; 3] {
+        [
+            DistillCompressionLevel::Lossless,
+            DistillCompressionLevel::Balanced,
+            DistillCompressionLevel::Aggressive,
         ]
     }
 }
@@ -635,6 +658,10 @@ impl SmartPicker {
             models: Vec::new(),
             model_index: 0,
             execution_mode_index: 0,
+            compression_level_index: DistillCompressionLevel::all()
+                .iter()
+                .position(|level| *level == context.args.distill_compression_level)
+                .unwrap_or(1),
             step: SmartStep::Provider,
             preview: None,
         };
@@ -713,15 +740,62 @@ impl SmartPicker {
                         .min(SmartExecutionMode::all().len().saturating_sub(1));
                 }
                 (SmartStep::Mode, KeyCode::Enter) => {
+                    let execution_mode = picker.selected_execution_mode();
+                    if execution_mode.uses_distill() {
+                        picker.preview = None;
+                        picker.step = SmartStep::Compression;
+                    } else {
+                        let provider = picker.selected_provider().to_string();
+                        let model = picker.selected_model()?.model.clone();
+                        picker.preview = Some(
+                            build_preview(
+                                &context,
+                                provider,
+                                model,
+                                execution_mode,
+                                picker.selected_compression_level(),
+                            )
+                            .await?,
+                        );
+                        picker.step = SmartStep::Confirm;
+                    }
+                }
+                (SmartStep::Compression, KeyCode::Esc) => {
+                    picker.preview = None;
+                    picker.step = SmartStep::Mode;
+                }
+                (SmartStep::Compression, KeyCode::Up) => {
+                    picker.preview = None;
+                    picker.compression_level_index =
+                        picker.compression_level_index.saturating_sub(1);
+                }
+                (SmartStep::Compression, KeyCode::Down) => {
+                    picker.preview = None;
+                    picker.compression_level_index = (picker.compression_level_index + 1)
+                        .min(DistillCompressionLevel::all().len().saturating_sub(1));
+                }
+                (SmartStep::Compression, KeyCode::Enter) => {
                     let provider = picker.selected_provider().to_string();
                     let model = picker.selected_model()?.model.clone();
                     let execution_mode = picker.selected_execution_mode();
-                    picker.preview =
-                        Some(build_preview(&context, provider, model, execution_mode).await?);
+                    picker.preview = Some(
+                        build_preview(
+                            &context,
+                            provider,
+                            model,
+                            execution_mode,
+                            picker.selected_compression_level(),
+                        )
+                        .await?,
+                    );
                     picker.step = SmartStep::Confirm;
                 }
                 (SmartStep::Confirm, KeyCode::Esc) => {
-                    picker.step = SmartStep::Mode;
+                    picker.step = if picker.selected_execution_mode().uses_distill() {
+                        SmartStep::Compression
+                    } else {
+                        SmartStep::Mode
+                    };
                 }
                 (SmartStep::Confirm, KeyCode::Enter) => {
                     let preview = picker.preview.clone().context("missing smart preview")?;
@@ -751,6 +825,13 @@ impl SmartPicker {
             .get(self.execution_mode_index)
             .copied()
             .unwrap_or(SmartExecutionMode::Direct)
+    }
+
+    fn selected_compression_level(&self) -> DistillCompressionLevel {
+        DistillCompressionLevel::all()
+            .get(self.compression_level_index)
+            .copied()
+            .unwrap_or(DistillCompressionLevel::Balanced)
     }
 }
 
@@ -832,6 +913,7 @@ async fn build_preview(
     provider: String,
     model: String,
     execution_mode: SmartExecutionMode,
+    distill_compression_level: DistillCompressionLevel,
 ) -> Result<SmartPreview> {
     let target_config = load_runtime_config(
         None,
@@ -846,6 +928,7 @@ async fn build_preview(
         provider,
         model,
         execution_mode,
+        distill_compression_level,
         target_context_window: target_config.model_context_window,
         target_auto_compact_token_limit: target_config.model_auto_compact_token_limit,
         target_config,
@@ -956,6 +1039,22 @@ fn strategy_label_zh(strategy: SmartStrategy) -> &'static str {
     }
 }
 
+fn compression_level_label(level: DistillCompressionLevel) -> &'static str {
+    match level {
+        DistillCompressionLevel::Lossless => "lossless",
+        DistillCompressionLevel::Balanced => "balanced",
+        DistillCompressionLevel::Aggressive => "aggressive",
+    }
+}
+
+fn compression_level_label_zh(level: DistillCompressionLevel) -> &'static str {
+    match level {
+        DistillCompressionLevel::Lossless => "无损压缩",
+        DistillCompressionLevel::Balanced => "中等压缩",
+        DistillCompressionLevel::Aggressive => "极限压缩",
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1020,8 +1119,8 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
 
     frame.render_widget(
         Paragraph::new(match picker.language {
-            PickerLanguage::English => "Smart switch · select provider, then model, then confirm",
-            PickerLanguage::Chinese => "Smart 切换 · 先选 provider，再选 model，最后确认",
+            PickerLanguage::English => "Smart switch · select provider, model, mode, then confirm",
+            PickerLanguage::Chinese => "Smart 切换 · 选择 provider、model、模式后再确认",
         }),
         areas[0],
     );
@@ -1044,6 +1143,10 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
             SmartStep::Mode => match picker.language {
                 PickerLanguage::English => "Select execution mode",
                 PickerLanguage::Chinese => "选择执行模式",
+            },
+            SmartStep::Compression => match picker.language {
+                PickerLanguage::English => "Select compression level",
+                PickerLanguage::Chinese => "选择提炼压缩等级",
             },
             SmartStep::Confirm => match picker.language {
                 PickerLanguage::English => "Confirm",
@@ -1187,6 +1290,55 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                 .collect::<Vec<_>>();
             frame.render_widget(List::new(items), list_inner);
         }
+        SmartStep::Compression => {
+            let items = DistillCompressionLevel::all()
+                .iter()
+                .enumerate()
+                .map(|(index, level)| {
+                    let (title, description) = match (picker.language, level) {
+                        (PickerLanguage::English, DistillCompressionLevel::Lossless) => (
+                            "Lossless",
+                            "Keep far more corrections, conventions, and active context",
+                        ),
+                        (PickerLanguage::English, DistillCompressionLevel::Balanced) => (
+                            "Balanced",
+                            "Default; compress clearly while keeping implementation-safe detail",
+                        ),
+                        (PickerLanguage::English, DistillCompressionLevel::Aggressive) => (
+                            "Aggressive",
+                            "Match the old terse style and keep only highest-signal context",
+                        ),
+                        (PickerLanguage::Chinese, DistillCompressionLevel::Lossless) => {
+                            ("无损压缩", "尽量保留纠正、规范和当前上下文，压缩最少")
+                        }
+                        (PickerLanguage::Chinese, DistillCompressionLevel::Balanced) => {
+                            ("中等压缩", "默认方案；明显减重，但保留安全实现所需细节")
+                        }
+                        (PickerLanguage::Chinese, DistillCompressionLevel::Aggressive) => {
+                            ("极限压缩", "接近旧版极简风格，只保留最高信号上下文")
+                        }
+                    };
+                    let line = if index == picker.compression_level_index {
+                        Line::from(vec![
+                            "› ".green().bold(),
+                            title.bold(),
+                            " · ".dim(),
+                            description.into(),
+                        ])
+                        .reversed()
+                    } else {
+                        Line::from(vec![
+                            "  ".into(),
+                            title.into(),
+                            " · ".dim(),
+                            description.into(),
+                        ])
+                    };
+                    ListItem::new(line)
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(List::new(items), list_inner);
+        }
         SmartStep::Confirm => {
             let preview = picker.preview.as_ref();
             let lines = vec![
@@ -1281,6 +1433,26 @@ fn draw_picker(frame: &mut Frame<'_>, picker: &SmartPicker) {
                     ),
                     (PickerLanguage::English, None) => "Execution mode: ".to_string(),
                     (PickerLanguage::Chinese, None) => "执行模式：".to_string(),
+                }),
+                Line::from(match (picker.language, preview) {
+                    (PickerLanguage::English, Some(preview))
+                        if preview.selection.execution_mode.uses_distill() =>
+                    {
+                        format!(
+                            "Compression level: {}",
+                            compression_level_label(preview.selection.distill_compression_level)
+                        )
+                    }
+                    (PickerLanguage::Chinese, Some(preview))
+                        if preview.selection.execution_mode.uses_distill() =>
+                    {
+                        format!(
+                            "压缩等级：{}",
+                            compression_level_label_zh(preview.selection.distill_compression_level)
+                        )
+                    }
+                    (PickerLanguage::English, _) => "Compression level: n/a".to_string(),
+                    (PickerLanguage::Chinese, _) => "压缩等级：不适用".to_string(),
                 }),
                 Line::from(match (picker.language, preview) {
                     (PickerLanguage::English, Some(preview)) => {
@@ -1447,6 +1619,7 @@ mod tests {
     use super::SmartStrategy;
     use super::collect_provider_choices;
     use super::plan_preview;
+    use crate::cli::DistillCompressionLevel;
     use crate::cli::SmartArgs;
     use crate::cli::TargetArgs;
     use crate::types::SessionSummary;
@@ -1513,12 +1686,14 @@ mod tests {
                 write_profile: None,
                 archive_source: false,
                 max_pre_compactions: 3,
+                distill_compression_level: DistillCompressionLevel::Balanced,
                 timeout_secs: 300,
             },
             SmartSelection {
                 provider: "openai".to_string(),
                 model: "gpt-5.2".to_string(),
                 execution_mode: SmartExecutionMode::Direct,
+                distill_compression_level: DistillCompressionLevel::Balanced,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1566,12 +1741,14 @@ mod tests {
                 write_profile: Some("yunyi-256k".to_string()),
                 archive_source: true,
                 max_pre_compactions: 3,
+                distill_compression_level: DistillCompressionLevel::Balanced,
                 timeout_secs: 300,
             },
             SmartSelection {
                 provider: "yunyi".to_string(),
                 model: "gpt-5.2".to_string(),
                 execution_mode: SmartExecutionMode::Direct,
+                distill_compression_level: DistillCompressionLevel::Balanced,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1618,12 +1795,14 @@ mod tests {
                 write_profile: Some("distilled".to_string()),
                 archive_source: true,
                 max_pre_compactions: 3,
+                distill_compression_level: DistillCompressionLevel::Lossless,
                 timeout_secs: 300,
             },
             SmartSelection {
                 provider: "yunyi".to_string(),
                 model: "gpt-5.2".to_string(),
                 execution_mode: SmartExecutionMode::DistillCodex,
+                distill_compression_level: DistillCompressionLevel::Lossless,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1632,6 +1811,10 @@ mod tests {
 
         assert_eq!(preview.strategy, SmartStrategy::DistillSuccessor);
         assert_eq!(preview.blocked_reason, None);
+        assert_eq!(
+            preview.selection.distill_compression_level,
+            DistillCompressionLevel::Lossless
+        );
     }
 
     #[tokio::test]
@@ -1666,12 +1849,14 @@ mod tests {
                 write_profile: Some("distilled".to_string()),
                 archive_source: false,
                 max_pre_compactions: 3,
+                distill_compression_level: DistillCompressionLevel::Aggressive,
                 timeout_secs: 300,
             },
             SmartSelection {
                 provider: "openai".to_string(),
                 model: "gpt-5.2".to_string(),
                 execution_mode: SmartExecutionMode::DistillDeterministic,
+                distill_compression_level: DistillCompressionLevel::Aggressive,
                 target_config: config,
                 target_context_window: Some(258400),
                 target_auto_compact_token_limit: Some(232560),
@@ -1680,5 +1865,9 @@ mod tests {
 
         assert_eq!(preview.strategy, SmartStrategy::DistillSuccessor);
         assert_eq!(preview.blocked_reason, None);
+        assert_eq!(
+            preview.selection.distill_compression_level,
+            DistillCompressionLevel::Aggressive
+        );
     }
 }

@@ -872,10 +872,10 @@ impl Action {
                 "Compact if needed, then fork to a new runtime shape"
             }
             (Action::Smart, Language::English) => {
-                "Guided provider/model switch with automatic runtime repair"
+                "Guided provider/model switch with automatic runtime repair or distill"
             }
             (Action::Distill, Language::English) => {
-                "Create a lighter successor session from a heavy source thread"
+                "Create a lighter successor session with selectable compression levels"
             }
             (Action::Show, Language::Chinese) => "查看这个线程的派生摘要信息",
             (Action::FirstTokenPreview, Language::Chinese) => {
@@ -898,9 +898,11 @@ impl Action {
             (Action::Rollback, Language::Chinese) => "丢弃最后 N 个用户轮次",
             (Action::Migrate, Language::Chinese) => "按需 compact 后迁移到新的运行时形态",
             (Action::Smart, Language::Chinese) => {
-                "通过向导切换 provider/model，并自动修复运行时状态"
+                "通过向导切换 provider/model，并自动修复或提炼运行时状态"
             }
-            (Action::Distill, Language::Chinese) => "从重会话里提炼出一个更轻的继任会话",
+            (Action::Distill, Language::Chinese) => {
+                "从重会话里提炼出一个更轻的继任会话，并可选压缩等级"
+            }
         }
     }
 
@@ -943,7 +945,7 @@ impl Action {
             (Action::Migrate, _) => Some(
                 "--provider yunyi --model gpt-5.2 --context-window 258400 --write-profile yunyi-256k --archive-source",
             ),
-            (Action::Distill, _) => Some("--preview-only"),
+            (Action::Distill, _) => Some("--compression-level balanced --preview-only"),
             (Action::Show, _)
             | (Action::FirstTokenPreview, _)
             | (Action::Repair, _)
@@ -2157,19 +2159,41 @@ fn format_smart_progress(language: Language, event: &SmartProgressEvent) -> Stri
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "未知".to_string())
         ),
-        (Language::English, SmartProgressEvent::StartingDistill { mode }) => format!(
-            "Delegating to the distill pipeline in `{}` mode.",
+        (
+            Language::English,
+            SmartProgressEvent::StartingDistill {
+                mode,
+                compression_level,
+            },
+        ) => format!(
+            "Delegating to the distill pipeline in `{}` mode with `{}` compression.",
             match mode {
                 crate::cli::DistillMode::Codex => "codex",
                 crate::cli::DistillMode::Deterministic => "deterministic",
-            }
+            },
+            match compression_level {
+                crate::cli::DistillCompressionLevel::Lossless => "lossless",
+                crate::cli::DistillCompressionLevel::Balanced => "balanced",
+                crate::cli::DistillCompressionLevel::Aggressive => "aggressive",
+            },
         ),
-        (Language::Chinese, SmartProgressEvent::StartingDistill { mode }) => format!(
-            "正在进入 distill 流程，模式：{}。",
+        (
+            Language::Chinese,
+            SmartProgressEvent::StartingDistill {
+                mode,
+                compression_level,
+            },
+        ) => format!(
+            "正在进入 distill 流程，模式：{}，压缩等级：{}。",
             match mode {
                 crate::cli::DistillMode::Codex => "Codex 提炼",
                 crate::cli::DistillMode::Deterministic => "规则提炼",
-            }
+            },
+            match compression_level {
+                crate::cli::DistillCompressionLevel::Lossless => "无损压缩",
+                crate::cli::DistillCompressionLevel::Balanced => "中等压缩",
+                crate::cli::DistillCompressionLevel::Aggressive => "极限压缩",
+            },
         ),
         (
             Language::English,

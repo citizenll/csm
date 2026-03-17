@@ -13,6 +13,13 @@ pub(crate) enum DistillMode {
     Deterministic,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum DistillCompressionLevel {
+    Lossless,
+    Balanced,
+    Aggressive,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "codex-session-manager")]
 #[command(about = "Low-level Codex session and rollout manager")]
@@ -272,6 +279,10 @@ pub(crate) struct SmartArgs {
     #[arg(long, default_value_t = 3)]
     pub(crate) max_pre_compactions: u32,
 
+    /// Compression level used when the smart flow chooses a distill path.
+    #[arg(long, value_enum, default_value_t = DistillCompressionLevel::Balanced)]
+    pub(crate) distill_compression_level: DistillCompressionLevel,
+
     /// Maximum seconds to wait for each compaction step.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub(crate) timeout_secs: u64,
@@ -301,6 +312,10 @@ pub(crate) struct DistillArgs {
     /// Distillation backend to use for generating the successor handoff brief.
     #[arg(long, value_enum, default_value_t = DistillMode::Codex)]
     pub(crate) distill_mode: DistillMode,
+
+    /// Compression level for the successor handoff brief.
+    #[arg(long, value_enum, default_value_t = DistillCompressionLevel::Balanced)]
+    pub(crate) compression_level: DistillCompressionLevel,
 
     /// Optional reasoning effort for Codex-backed distillation.
     #[arg(long)]

@@ -1,3 +1,4 @@
+use crate::cli::DistillCompressionLevel;
 use crate::cli::DistillMode;
 
 pub(crate) type ProgressSender = std::sync::mpsc::Sender<OperationProgressEvent>;
@@ -64,6 +65,7 @@ pub(crate) enum SmartProgressEvent {
     },
     StartingDistill {
         mode: DistillMode,
+        compression_level: DistillCompressionLevel,
     },
     CheckingContextWindow {
         current_tokens: i64,

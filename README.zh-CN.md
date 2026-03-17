@@ -22,7 +22,7 @@
 2. **🚚 无痛换模型/服务商 (Provider Migration)**
 想把当前的对话无缝切换到另一个大模型（比如换到拥有更大上下文的模型）？CSM 提供引导式的“搬家”服务，不丢失历史记录。
 3. **🧳 轻量继任会话 (Distill)**
-当一个长期沿用的项目对话变得越来越重、越来越难恢复时，CSM 可以把它的有效历史提炼成一个更轻的新会话，显著降低冷启动成本。
+当一个长期沿用的项目对话变得越来越重、越来越难恢复时，CSM 可以把它的有效历史提炼成一个更轻的新会话，显著降低冷启动成本。提炼支持三档压缩：`lossless`、`balanced`（默认）和 `aggressive`。
 4. **🧪 首轮请求预演 (First-Request Preview)**
 CSM 可以重建 Codex 在 resume 后下一次真正会发送的请求，包含重建后的历史、base instructions 与内置工具 schema 估算，方便你在打开重会话前先看清冷启动成本。
 5. **🔍 历史对话透视镜 (Inspection)**
@@ -36,7 +36,7 @@ CSM 的所有操作都遵循 Codex 原生规则，不会强行篡改或损坏你
 
 如果你不想记任何复杂的命令，日常操作只需要记住这一个：`smart`。
 
-**`smart` 模式是 CSM 最核心的功能。** 你只需要告诉它你想处理哪个对话，它就会弹出一个引导菜单，让你选择想要切换的服务商或模型，然后它会自动帮你判断：是直接在原对话上修复，还是平滑地迁移到一个新对话。
+**`smart` 模式是 CSM 最核心的功能。** 你只需要告诉它你想处理哪个对话，它就会弹出一个引导菜单，让你选择想要切换的服务商或模型，然后它会自动帮你判断：是直接在原对话上修复、平滑迁移到一个新对话，还是提炼出一个可选压缩等级的轻量继任会话。
 
 默认情况下，`smart` 及相关流程**不会**自动往 `config.toml` 写入新 profile。只有你显式传入 `--write-profile` 时，才会把运行时配置持久化。
 
@@ -52,6 +52,11 @@ cargo run -- smart <对话的ID或路径>
 ```powershell
 cargo run -- distill <对话的ID或路径>
 ```
+
+压缩等级建议：
+- `lossless`：尽量保留更多纠正、规范和当前上下文
+- `balanced`：新的默认档，明显减重，同时保留安全实现所需细节
+- `aggressive`：最接近旧版极简提炼风格
 
 ---
 
@@ -87,10 +92,11 @@ cargo run -- distill <对话的ID或路径>
 
 ### 🟡 进阶与迁移
 
+* **Smart 智能向导**：`cargo run -- smart <ID>` （在交互式选择器里选择 provider、model、执行模式，以及提炼压缩等级）
 * **分支对话 (Fork)**：`cargo run -- fork <ID> --provider openrouter --model gpt-5` （基于当前对话分出一个新对话，并使用新模型）
 * **瘦身压缩 (Compact)**：`cargo run -- compact <ID>` （压缩对话历史，释放上下文空间）
 * **手动迁移 (Migrate)**：`cargo run -- migrate <ID> --provider ...` （专为从大窗口模型迁移到小窗口模型设计，会自动帮你压缩并分支）
-* **提炼轻量继任会话 (Distill)**：`cargo run -- distill <ID>` （生成 deterministic handoff brief，并创建一个更轻的新会话）
+* **提炼轻量继任会话 (Distill)**：`cargo run -- distill <ID> --compression-level balanced` （生成 deterministic handoff brief，并创建一个更轻的新会话）
 
 ### 🔴 故障急救 (Repair)
 
