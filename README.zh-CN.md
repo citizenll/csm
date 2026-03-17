@@ -23,9 +23,11 @@
 想把当前的对话无缝切换到另一个大模型（比如换到拥有更大上下文的模型）？CSM 提供引导式的“搬家”服务，不丢失历史记录。
 3. **🧳 轻量继任会话 (Distill)**
 当一个长期沿用的项目对话变得越来越重、越来越难恢复时，CSM 可以把它的有效历史提炼成一个更轻的新会话，显著降低冷启动成本。
-4. **🔍 历史对话透视镜 (Inspection)**
+4. **🧪 首轮请求预演 (First-Request Preview)**
+CSM 可以重建 Codex 在 resume 后下一次真正会发送的请求，包含重建后的历史、base instructions 与内置工具 schema 估算，方便你在打开重会话前先看清冷启动成本。
+5. **🔍 历史对话透视镜 (Inspection)**
 清晰地看到每个对话到底用了哪个模型、消耗了多少 Token、当前的上下文占用量是多少。
-5. **🛡️ 绝对安全 (Safe-by-default)**
+6. **🛡️ 绝对安全 (Safe-by-default)**
 CSM 的所有操作都遵循 Codex 原生规则，不会强行篡改或损坏你的原始聊天记录。
 
 ---
@@ -35,6 +37,8 @@ CSM 的所有操作都遵循 Codex 原生规则，不会强行篡改或损坏你
 如果你不想记任何复杂的命令，日常操作只需要记住这一个：`smart`。
 
 **`smart` 模式是 CSM 最核心的功能。** 你只需要告诉它你想处理哪个对话，它就会弹出一个引导菜单，让你选择想要切换的服务商或模型，然后它会自动帮你判断：是直接在原对话上修复，还是平滑地迁移到一个新对话。
+
+默认情况下，`smart` 及相关流程**不会**自动往 `config.toml` 写入新 profile。只有你显式传入 `--write-profile` 时，才会把运行时配置持久化。
 
 ```powershell
 # 启动智能向导，<ID> 替换为你的对话ID或路径
@@ -55,7 +59,7 @@ cargo run -- distill <对话的ID或路径>
 
 直接运行 `cargo run --` 即可进入可视化界面。系统会根据你的电脑语言自动适配（支持中/英文）。
 
-* **主界面**：按服务商（Provider）对你所有的对话进行分类。你可以清晰地看到对话预览、当前模型、上下文窗口大小和 Token 消耗。
+* **主界面**：按**持久化 provider**（rollout 元数据里记录的 provider）对你所有的对话进行分类。这样列表归属和你后续实际选择的运行时 provider 会清楚分开。
 * **操作菜单**：选中一个对话按下 `Enter`（回车），就会弹出该对话的专属操作菜单（包含 `smart` 智能迁移、修复、重命名等）。
 * **快捷键**：
 * `↑ / ↓`：上下移动
@@ -76,6 +80,7 @@ cargo run -- distill <对话的ID或路径>
 ### 🟢 日常管理
 
 * **查看对话详情**：`cargo run -- show <ID>` （加上 `--json` 可以输出代码格式）
+* **预演首轮完整请求**：`cargo run -- first-token-preview <ID>` （重建下一次 resume 请求，并估算历史、base instructions、工具 schema 与总提示词体积）
 * **给对话改个名**：`cargo run -- rename <ID> "我的新项目对话"`
 * **复制恢复命令**：`cargo run -- copy-deeplink <ID>` （复制一串命令，发给别人或在其他终端直接恢复该对话）
 * **归档/取消归档**：`cargo run -- archive <ID>` 或 `unarchive <ID>`
@@ -102,3 +107,4 @@ CSM 虽然提供了高层的封装，但绝非“魔法”。它**不会**发明
 * **数据源真实**：它直接操作 `$CODEX_HOME` 下真实的 Codex rollout 文件和配置状态。
 * **原生语义**：底层直接复用了 Codex 的 Rust 核心逻辑（如 `ThreadManager::fork_thread`，`Op::Compact` 等）。
 * **文件结构**：核心逻辑位于 `src/operations.rs`（原生操作）与 `src/rollout_edit.rs`（JSONL 底层修复），通过 `src/commands.rs` 进行调度。
+* **Prompt Reconstruction**：`first-token-preview` 与 prompt-based `distill` 会先重建模型真正可见的 resume 上下文，再进行估算或生成 successor handoff。

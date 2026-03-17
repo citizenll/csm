@@ -22,9 +22,11 @@ Conversation refusing to load? CSM can help you rebuild and repair the session s
 Want to seamlessly move your current chat to a different AI model (like one with a larger context window)? CSM offers a guided "moving service" so you don't lose your place.
 3. **🧳 Lightweight Successor Sessions (Distill)**
 When one long-lived project thread becomes expensive to reopen, CSM can distill its effective history into a lighter successor session with a much smaller cold-start footprint.
-4. **🔍 Chat History X-Ray (Inspection)**
+4. **🧪 First-Request Preview**
+CSM can reconstruct the next request Codex will actually send on resume, including rebuilt history, base instructions, and built-in tool schema estimates, so you can understand cold-start cost before opening a heavy thread.
+5. **🔍 Chat History X-Ray (Inspection)**
 Get a clear, transparent view of every thread: see exactly which model was used, how many tokens were consumed, and your current context footprint.
-5. **🛡️ Completely Safe (Safe-by-default)**
+6. **🛡️ Completely Safe (Safe-by-default)**
 Every operation in CSM strictly follows native Codex rules. It will never blindly rewrite history or corrupt your original chat logs.
 
 ---
@@ -34,6 +36,8 @@ Every operation in CSM strictly follows native Codex rules. It will never blindl
 If you don't want to memorize complex commands, you only need to remember one: `smart`.
 
 **The `smart` mode is the heart of CSM.** Just point it to a conversation, and it will pop up a guided menu letting you pick a new provider or model. It then automatically figures out the best path forward: whether to repair your current thread in place or smoothly migrate your history to a new one.
+
+By default, `smart` and related flows do **not** write new profiles into `config.toml`. Profile writes are opt-in only when you explicitly pass `--write-profile`.
 
 ```powershell
 # Launch the smart wizard (replace <ID> with your thread ID or path)
@@ -55,7 +59,7 @@ cargo run -- distill <thread-id-or-path>
 
 Simply run `cargo run --` to enter the visual interface. The system will automatically detect your computer's language (supports English/Chinese).
 
-* **Main Screen**: Your active and archived threads are neatly grouped by Provider. You get a split-view showing chat previews, current models, context window sizes, and token usage.
+* **Main Screen**: Your active and archived threads are grouped by **persisted provider** (the provider recorded in the rollout metadata). This keeps list grouping separate from the provider you may choose later at runtime.
 * **Action Menu**: Press `Enter` on any thread to open its dedicated action menu (where you can run `smart` migration, repair, rename, etc.).
 * **Shortcuts**:
 * `↑ / ↓`: Move up/down
@@ -76,6 +80,7 @@ For those who prefer the command line, CSM offers a rich set of direct commands:
 ### 🟢 Daily Management
 
 * **Inspect a thread**: `cargo run -- show <ID>` (add `--json` for raw output)
+* **Preview the first full request**: `cargo run -- first-token-preview <ID>` (reconstructs the next resume request and estimates rebuilt history, base instructions, tool schema, and total prompt size)
 * **Rename a thread**: `cargo run -- rename <ID> "My New Project Chat"`
 * **Copy resume link**: `cargo run -- copy-deeplink <ID>` (Copies the canonical `codex resume...` command so you can paste it in another terminal or send it to a teammate)
 * **Archive / Unarchive**: `cargo run -- archive <ID>` or `unarchive <ID>`
@@ -102,6 +107,7 @@ While CSM provides a user-friendly high-level wrapper, it isn't "magic." It **do
 * **Real Data Sources**: It operates directly on real Codex rollout files and config states under `$CODEX_HOME`.
 * **Native Semantics**: It intentionally reuses Codex's internal Rust core logic (e.g., `ThreadManager::fork_thread`, `Op::Compact`).
 * **Architecture**: Core operations live in `src/operations.rs` (native actions) and `src/rollout_edit.rs` (JSONL surgery), orchestrated safely by `src/commands.rs`.
+* **Prompt Reconstruction**: `first-token-preview` and prompt-based `distill` rebuild the model-visible resume context from rollout history before estimating or generating successor handoff briefs.
 
 ---
 

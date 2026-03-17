@@ -1239,8 +1239,8 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 fn draw_thread_list(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let block = Block::default()
         .title(match app.language {
-            Language::English => "Threads by provider",
-            Language::Chinese => "按 provider 分组的线程",
+            Language::English => "Threads by persisted provider",
+            Language::Chinese => "按持久化 provider 分组的线程",
         })
         .borders(Borders::ALL);
     let inner = block.inner(area);
@@ -1348,7 +1348,7 @@ fn draw_thread_details(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 .into(),
         ]),
         Line::from(vec![
-            field_label(app.language, "Provider", "Provider"),
+            field_label(app.language, "Persisted provider", "持久化 provider"),
             thread.provider.clone().into(),
         ]),
         Line::from(vec![
@@ -1403,6 +1403,14 @@ fn draw_thread_details(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 .into(),
         ]),
     ];
+
+    details.push(Line::from(match app.language {
+        Language::English => {
+            "Resume/fork uses the current runtime config and may differ from the persisted provider."
+                .dim()
+        }
+        Language::Chinese => "resume/fork 使用当前运行时配置，可能与持久化 provider 不同。".dim(),
+    }));
 
     match app.selected_detail() {
         Some(DetailState::Loaded(summary)) => {
